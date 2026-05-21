@@ -1,0 +1,9 @@
+bibentry(
+  bibtype  = "Manual",
+  title    = "SIACS: Simplified Indoor Air Chemistry Simulator",
+  author   = person("User", role = c("aut", "cre"),
+                    email = "user@example.com"),
+  year     = "2026",
+  note     = "R package version 0.2.0",
+  url      = "https://github.com/your-org/SIACS"
+)

@@ -1,0 +1,3 @@
+# m2,m,Unitless (width to depth),deg (CW from North),m^-1,m2,(L/s)^2/(cm^4 K),(L/s)^2/(cm^4 (m/s)^2),Unitless,m/s2,m,m,Unitless,deg,deg,m (asl),Unitless,Unitless (attenuation exponent),km,km,Unitless
+FloorSurfaceArea,RoomHeight,AspectRatio,OrientationWiderSide,AreaToVolume,InfiltrationSurfaceArea,StackCoefficient,WindCoefficient,DischargeCoefficient,GravityAccel,MidpointHeightofWindow,NeutralPressureLevel,OpeningEffectivenessCoefficient,Latitude,Longitude,Altitude,SurfaceAlbedo,CloudOpticalDepth,CloudBase,CloudTop,IndoorReflectance
+140,2.5,0.66,0,2.5,0.1,0.00029,0.000231,0.65,9.8,0.91,2.75,0.3,33.79991,-84.4087,306,0.1,0,4,5,0.5

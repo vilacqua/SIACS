@@ -1,0 +1,3 @@
+#Gregorian,1 to 12,1 to 31,hour:min:sec,R POSIX time zones,min,min,hours,min
+StartTimeYear,StartTimeMonth,StartTimeDay,StartTime,StartTimeStandard,RelativeStartTime,TimeStep,Duration,ActivityTransition
+2022,7,7,20:00:00,EST5EDT,0,5,27,1
