@@ -1,6 +1,5 @@
 # SIACS — Simplified Indoor Air Chemistry Simulator
 
-#Version 0526 for Beta release
 
 SIACS is an ODE-based box model for simulating indoor air quality, including
 gas-phase photochemistry, ventilation, surface deposition, and indoor emissions
@@ -118,8 +117,8 @@ vignette("SIACS_intro")  # Full worked example
 If you use SIACS in your work, please cite:
 
 ```
-[Authors]. SIACS: Simulation of Indoor Air Chemistry and Surfaces.
-R package version 0.2.0. [Year]. [DOI or URL]
+[US EPA]. SIACS: Simulation of Indoor Air Chemistry and Surfaces.
+R package version 0526 (Beta) [2026]. [DOI or URL]
 ```
 
 See `citation("SIACS")` for the full citation in BibTeX format.
