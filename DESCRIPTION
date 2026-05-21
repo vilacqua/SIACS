@@ -1,0 +1,49 @@
+Package: SIACS
+Type: Package
+Title: Simulation of Indoor Air Chemistry and Surfaces
+Version: 0.2.0
+Date: 2026-02-27
+Authors@R: person(
+    given   = "User",
+    family  = "",
+    role    = c("aut", "cre"),
+    email   = "user@example.com",
+    comment = c(ORCID = "")
+  )
+Description: An ODE-based box model for simulating indoor air chemistry,
+    including gas-phase photochemistry (SAPRC99 and SAPRC07T mechanisms),
+    ventilation, surface deposition, indoor emissions from occupant
+    activities, and natural and artificial lighting. Integrates the TUV
+    (Tropospheric Ultraviolet and Visible) radiation model to calculate
+    indoor photolysis rates from outdoor solar conditions and building
+    optical properties. Optional analyses include time derivatives, mass
+    balance component separation, first-order sensitivity analysis, and
+    uncertainty propagation. Two usage modes are provided: (1) an
+    interactive Shiny GUI launched via runSIACSApp(), with both a
+    step-by-step Wizard and a full Advanced interface; (2) a batch mode
+    via SIACS.batch() for programmatic, parallelised multi-scenario runs.
+License: GPL-3
+Encoding: UTF-8
+LazyData: true
+Depends:
+    R (>= 4.0.0)
+Imports:
+    shiny,
+    rhandsontable,
+    shinyjs,
+    shinyBS,
+    readxl,
+    deSolve,
+    parallel,
+    foreach,
+    doParallel,
+    ggplot2,
+    reshape,
+    openxlsx
+Suggests:
+    knitr,
+    rmarkdown
+VignetteBuilder: knitr
+RoxygenNote: 7.3.2
+URL: https://github.com/your-org/SIACS
+BugReports: https://github.com/your-org/SIACS/issues
