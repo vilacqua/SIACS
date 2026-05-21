@@ -1,0 +1,264 @@
+---
+title: "Introduction to SIACS: Simulation of Indoor Air Chemistry and Surfaces"
+author: "SIACS Development Team"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{Introduction to SIACS}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment  = "#>",
+  eval     = FALSE   # set FALSE so examples don't run during CRAN check
+)
+```
+
+## Overview
+
+**SIACS** (Simulation of Indoor Air Chemistry and Surfaces) is an ODE-based
+single-zone box model for simulating indoor air quality. It solves the
+mass-balance equations for all tracked chemical species simultaneously,
+accounting for:
+
+- Gas-phase photochemistry (SAPRC99 or SAPRC07T, ~211 reactions)
+- Ventilation (infiltration, balanced, unbalanced, and natural ventilation)
+- Surface deposition (time-varying, activity-dependent)
+- Indoor emissions from occupant activities
+- Indoor light environment from outdoor solar radiation and artificial lights
+- Aerosol mass (PM₂.₅, PM₂.₅₋₁₀) and particle number concentrations
+
+Optional post-processing analyses include time derivatives (dy/dt), mass
+balance component separation, first-order sensitivity coefficients, and
+uncertainty propagation from input uncertainties.
+
+---
+
+## Installation
+
+```{r install}
+# From local source:
+install.packages("path/to/SIACS_0.2.0.tar.gz", repos = NULL, type = "source")
+
+# Load the package:
+library(SIACS)
+```
+
+---
+
+## Usage Mode 1: Interactive GUI
+
+The easiest way to get started is the Shiny GUI:
+
+```{r gui}
+library(SIACS)
+runSIACSApp()
+```
+
+This opens a browser window with two input interfaces:
+
+**Wizard Mode** (recommended for new users)  
+A step-by-step guided workflow:
+
+1. **Location & Time** — set latitude, longitude, start date/time, duration
+2. **Building** — floor area, room height, area-to-volume ratio
+3. **Windows** — orientation, area fraction, glass type, obstruction
+4. **Artificial Lights** — lamp type, geometry, schedule
+5. **Physical Environment** — indoor/outdoor temperature, humidity, pressure,
+   ventilation rates (as time schedules)
+6. **Outdoor Concentrations** — key species concentrations (ppm, time series)
+7. **Emissions & Activities** — select activity sources and schedules
+8. **Outputs** — choose output file names and optional analyses
+
+Default values are pre-loaded from the bundled example Atlanta scenario.
+
+**Advanced Mode**  
+Tab-based interface for uploading complete CSV/XLSX input files directly.
+Gives full control over all parameters.
+
+---
+
+## Usage Mode 2: Batch Scripting
+
+For multiple scenarios or integration into automated workflows, use
+`SIACS.batch()`.
+
+### Step 1: Prepare the input list
+
+Each element of `input_data_list` is a list of data frames, one per
+simulation instance. The example input files bundled with the package
+(accessible via `system.file("extdata", "Input", package = "SIACS")`)
+show the required format for each input type.
+
+```{r batch-inputs}
+library(SIACS)
+library(readxl)
+
+input_dir <- system.file("extdata", "Input", package = "SIACS")
+
+# Read example inputs for one instance:
+time_data   <- read.csv(file.path(input_dir, "Time.csv"))
+box_data    <- read.csv(file.path(input_dir, "BoxData - Atlanta.csv"))
+phys_env    <- read.csv(file.path(input_dir,
+                 "PhysicalEnvironmentData_CMAQ Atlanta_48hrs.csv"))
+outdoor     <- read.csv(file.path(input_dir,
+                 "Outdoor Concentrations - Atlanta July CMAQ.csv"))
+emissions   <- read.csv(file.path(input_dir, "EmissionProfiles.csv"))
+activities  <- read.csv(file.path(input_dir, "Activities.csv"))
+deposition  <- read.csv(file.path(input_dir, "Vd&P-Carslaw 2012.csv"))
+initial_val <- read.csv(file.path(input_dir,
+                 "InitialIndoorConcentrations.csv"))
+indoor_light <- read_excel(file.path(input_dir, "IndoorLightAtlanta.xlsx"),
+                            sheet = "J_values")
+```
+
+### Step 2: Assemble the input data list
+
+```{r batch-assemble}
+input_data_list <- list(
+  Time                 = list(time_data),
+  BoxData              = list(box_data),
+  PhysicalEnvironment  = list(phys_env),
+  OutdoorConcentrations = list(outdoor),
+  EmissionProfiles     = list(emissions),
+  Activities           = list(activities),
+  DepositionV          = list(deposition),
+  InitialValues        = list(initial_val),
+  IndoorLight          = list(
+    list(J_values    = as.data.frame(indoor_light),
+         EnergyFlux  = data.frame(Time = ..., EnergyFlux = ...))
+  )
+)
+```
+
+### Step 3: Define outputs
+
+```{r batch-outputs}
+output_list <- list(
+  list(
+    OutputTable                  = "./Output/Results",
+    OutputBasicChart             = "./Output/Plot",
+    OutputTimeDerivatives        = "./Output/Derivatives",
+    OutputMassBalanceComponents  = "./Output/MassBalance",
+    OutputSensitivity            = "None",
+    OutputUncertainty            = "None"
+  )
+)
+```
+
+### Step 4: Run
+
+```{r batch-run}
+results <- SIACS.batch(
+  input_data_list = input_data_list,
+  instances       = 1,
+  OutputList      = output_list,
+  mechanism       = "SAPRC99",
+  chemistry       = TRUE,
+  use_parallel    = FALSE   # use TRUE for multiple instances
+)
+```
+
+### Step 5: Inspect results
+
+```{r batch-results}
+# Main output data frame:
+out <- results[[1]]$Simulation1$alldata
+
+# View key species over time:
+head(out[, c("time", "O3", "NO2", "HCHO", "OH", "PM25")])
+
+# Time is in minutes; concentrations in ppm (gases) or µg/m³ (PM)
+```
+
+---
+
+## Input File Formats
+
+### Time (`Time.csv`)
+| Column | Description | Units |
+|---|---|---|
+| `StartTimeYear` | Calendar year | integer |
+| `StartTimeMonth` | Calendar month | 1–12 |
+| `StartTimeDay` | Calendar day | 1–31 |
+| `StartTime` | Local clock time (HH:MM) | character |
+| `StartTimeStandard` | Timezone code (e.g., EST) | character |
+| `RelativeStartTime` | Minutes from midnight | minutes |
+| `TimeStep` | Output time step | minutes |
+| `Duration` | Simulation length | hours |
+
+### Physical Environment (`PhysicalEnvironmentData.csv`)
+First row contains relative uncertainty values (fractions). Data rows
+contain time series with columns: `Time` (minutes), `Ti` (indoor temp, K),
+`To` (outdoor temp, K), `RH` (relative humidity, 0–1), `BP` (barometric
+pressure, Pa), `QBal` (balanced ventilation, m³/s), `QUnbal` (unbalanced,
+m³/s), `QNat` (natural, m³/s), `QFilter` (filter recirculation, m³/s),
+`Wind` (wind speed, m/s).
+
+### Outdoor Concentrations (`OutdoorConcentrations.csv`)
+First row: relative uncertainty fractions. Subsequent rows: time (minutes)
+and species concentrations in ppm. Columns are named by species code
+(e.g., `O3`, `NO2`, `NO`, `CO`, `SO2`, `HCHO`). Missing species default
+to zero.
+
+### Emission Profiles (`EmissionProfiles.csv`)
+First row: relative uncertainty fractions. Subsequent rows: one row per
+emission source profile, with `ProfileName` column and species columns
+giving emission rates in g/min per unit of source activity.
+
+---
+
+## Chemical Mechanisms
+
+SIACS implements two SAPRC-based gas-phase chemistry mechanisms:
+
+| Mechanism | Reference | Reactions |
+|---|---|---|
+| `SAPRC99` | Carter (2000) | 211 |
+| `SAPRC07T` | Carter (2010) | 211 |
+
+Both mechanisms include photolysis reactions whose rates are computed from
+the indoor light flux (J-values) calculated by the TUV model integration.
+Aggregated diagnostic species are also calculated and included in output:
+ALK (total alkanes), ARO (aromatics), OLE (alkenes), NOy (total reactive
+nitrogen), RO2 (peroxy radicals), HOx (OH + HO₂ + RO₂).
+
+---
+
+## Output Variables
+
+The main output data frame (`alldata`) contains columns for:
+
+- `time` — simulation time (minutes)
+- Indoor concentrations for all species (ppm for gases; µg/m³ for PM)
+- Outdoor concentrations for all species (suffix `.O`)  
+- Indoor emission source strengths (g/min for gases; µg/min for PM; suffix `.S`)
+- Physical environment: `Ti`, `To` (°C), `a` (air exchange rate, h⁻¹),
+  `LightFlux` (mW/cm²), `RH` (%), `BP` (Pa), `Mair.in` (molecules/cm³),
+  `QFilter` (m³/s)
+- Aggregated species: ALK, ARO, OLE, NOy, RO2, HOx (and outdoor counterparts)
+
+---
+
+## Citation
+
+```{r citation}
+citation("SIACS")
+```
+
+---
+
+## References
+
+Carter, W. P. L. (2000). Documentation of the SAPRC-99 chemical mechanism
+for VOC reactivity assessment. Final Report to the California Air Resources
+Board.
+
+Carter, W. P. L. (2010). Development of the SAPRC-07 chemical mechanism.
+*Atmospheric Environment*, 44(39), 5324–5335.
+
+Weschler, C. J., & Nazaroff, W. W. (2023). Human skin oil: a major ozone
+reactant indoors. *Environmental Science: Atmospheres*, 3(4), 640–661.
