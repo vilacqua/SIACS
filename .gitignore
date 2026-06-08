@@ -1,0 +1,41 @@
+# ── Build / distribution artifacts ──────────────────────────────────
+dist/
+dist_upload/
+installer/dist/
+*.zip
+
+# ── Portable R / packaged library (only ever live under dist/) ───────
+R-portable/
+library/
+
+# ── R bytecode (rebuilt at runtime in a per-user cache) ──────────────
+*.Rc
+
+# ── Runtime artifacts written during runs ───────────────────────────
+Output/
+Output_*/
+Input_*/
+Input_tmp_*/
+log__*.txt
+siacs_startup.log
+siacs_child_started.log
+siacs_child_steps.log
+siacs_*.log
+Rplots.pdf
+.Rhistory
+.RData
+
+# ── Dev-only / scratch ──────────────────────────────────────────────
+_smoke*.R
+_test*.R
+_repro*.R
+_diag*.R
+SIACS_cran_reference/
+Backup/
+
+# ── OS / editor ─────────────────────────────────────────────────────
+Thumbs.db
+Desktop.ini
+.DS_Store
+.vscode/
+.Rproj.user/

@@ -86,7 +86,13 @@ advanced_module_ui <- function() {
             style = "max-height: 90vh; overflow-y: auto;",
             tabsetPanel(
               id = "preview_tabs",
-              tabPanel("Data Preview", uiOutput("sheet_tabs"), value = "data_preview"),
+              tabPanel("Data Preview",
+                # Contextual event-adder: only shown for schedule-type files
+                # (Activities, Physical Environment, Artificial Light Schedule).
+                # Mirrors the Wizard's step-change events but works on whatever
+                # file is currently being previewed in the Advanced module.
+                uiOutput("adv_event_panel"),
+                uiOutput("sheet_tabs"), value = "data_preview"),
               tabPanel("Validation Summary", div(style = "padding: 15px;", htmlOutput("validation_summary")), value = "validation_summary")
             )
           )
@@ -185,13 +191,37 @@ advanced_module_server <- function(input, output, session, get_duration,
   }
   
   # helper to read CSV/XLSX, first sheet if multiple
+  #
+  # IMPORTANT — units & uncertainty preservation:
+  # SIACS input files for Physical Environment, Outdoor Concentrations and
+  # Emission Profiles carry TWO metadata pieces beyond the column headers:
+  #   (1) a leading units COMMENT line, e.g.  "# min,Kelvin,Kelvin,m2,..."
+  #   (2) an "Uncertainty" DATA row (first non-comment row) consumed by the
+  #       engine's ExtractUncertainty().
+  # read.csv(comment.char = "#") silently DROPS the units line. If we then
+  # write a snapshot with write.csv(), the units line is gone and the file
+  # structure the engine expects is broken. To prevent this, we capture the
+  # raw units comment line(s) here and stash them on the data frame as the
+  # attribute "siacs_units_header". write_data_csv() re-emits them on save.
   read_data <- function(file_path, show_error_modal = TRUE) {
     tryCatch({
       if (grepl("\\.csv$", file_path, ignore.case = TRUE)) {
+        # Capture any leading comment lines (units header) verbatim before
+        # read.csv strips them. Only contiguous comment lines at the very top
+        # are treated as the units header.
+        raw_lines    <- readLines(file_path, warn = FALSE)
+        units_header <- character(0)
+        for (ln in raw_lines) {
+          if (grepl("^\\s*#", ln)) units_header <- c(units_header, ln) else break
+        }
+
         df <- read.csv(file_path, comment.char = "#", na.strings = "None")
         if (nrow(df) == 0 || (nrow(df) == 1 && all(is.na(df[1, ])))) return(data.frame())
         # Trim leading/trailing whitespace from column names (e.g. "Smoking " -> "Smoking")
         names(df) <- trimws(names(df))
+        # Stash the units header so the snapshot writer can restore it.
+        if (length(units_header) > 0)
+          attr(df, "siacs_units_header") <- units_header
         return(df)
         
       } else if (grepl("\\.xlsx$", file_path, ignore.case = TRUE)) {
@@ -220,6 +250,115 @@ advanced_module_server <- function(input, output, session, get_duration,
     })
   }
   
+  # Write a data frame to CSV, restoring the units comment header captured by
+  # read_data() (attribute "siacs_units_header"). This keeps generated input
+  # copies structurally identical to the originals: units line first, then the
+  # column header, then the Uncertainty row, then the data.
+  #
+  # fallback_units: optional character vector of unit strings (one per column)
+  # used when the data frame has NO captured units attribute — e.g. tables
+  # generated or edited in the GUI. This ensures generated input files still
+  # carry a units line for downstream interpretation.
+  write_data_csv <- function(df, out_path, fallback_units = NULL) {
+    units_header <- attr(df, "siacs_units_header")
+
+    # If no captured header but a fallback was supplied and matches the column
+    # count, synthesise a units comment line from it.
+    if ((is.null(units_header) || length(units_header) == 0) &&
+        !is.null(fallback_units) && length(fallback_units) == ncol(df)) {
+      units_header <- paste0("# ", paste(fallback_units, collapse = ","))
+    }
+
+    if (is.null(units_header) || length(units_header) == 0) {
+      write.csv(df, out_path, row.names = FALSE)
+      return(invisible(out_path))
+    }
+    # Validate the units header column count matches the data. If the user
+    # added/removed columns in the GUI the stale header would misalign, so we
+    # drop it rather than write a corrupt file. Use read.csv to count fields so
+    # quoted values containing commas (e.g. "[0,1]") are counted correctly.
+    units_body   <- sub("^\\s*#", "", units_header[1])
+    n_units_cols <- tryCatch(
+      ncol(utils::read.csv(text = units_body, header = FALSE,
+                           check.names = FALSE, stringsAsFactors = FALSE)),
+      error = function(e) length(strsplit(units_body, ",")[[1]]))
+    if (n_units_cols != ncol(df)) {
+      cat(sprintf(
+        "[advanced_module] units header column count (%d) != data columns (%d) for %s; omitting stale units line\n",
+        n_units_cols, ncol(df), basename(out_path)))
+      write.csv(df, out_path, row.names = FALSE)
+      return(invisible(out_path))
+    }
+    # Write units comment line(s) first, then the standard CSV body appended
+    # to the same open connection so write.csv does not clobber the units line.
+    con <- file(out_path, open = "wt")
+    on.exit(close(con), add = TRUE)
+    writeLines(units_header, con)
+    suppressWarnings(utils::write.csv(df, con, row.names = FALSE))
+    invisible(out_path)
+  }
+
+  # Default units (one string per column) keyed by advanced file index, used
+  # as a fallback when a generated/edited table has no captured units header.
+  # Indices match titles_advanced / file_type_map in shared.R.
+  adv_fallback_units <- function(fi, df) {
+    if (is.null(df) || !is.data.frame(df)) return(NULL)
+    ncol_df <- ncol(df)
+    mk <- function(time_unit, rest_unit) c(time_unit, rep(rest_unit, ncol_df - 1))
+    switch(as.character(fi),
+      "3"  = c("min","Kelvin","Kelvin","m2","m3/s","m3/s","m3/s","[0,1]","Pascal","m/s"),  # Physical Environment
+      "5"  = mk("min", "multiples of profile"),     # Activities
+      "7"  = mk("min", "ppm"),                        # Outdoor Concentrations
+      "4"  = mk("", "g/min"),                         # Emission Profiles
+      "17" = mk("min", "W"),                          # Artificial Light Schedule
+      NULL)
+  }
+
+  # Parse the per-column unit strings from a data frame's captured units header
+  # (attribute "siacs_units_header"), falling back to adv_fallback_units(). The
+  # header looks like "# min,Kelvin,Kelvin,...". Returns a character vector with
+  # one unit per column, or NULL when no units are known.
+  adv_units_vector <- function(df, fi = NULL) {
+    uh <- attr(df, "siacs_units_header")
+    if (!is.null(uh) && length(uh) > 0) {
+      body <- sub("^\\s*#", "", uh[1])
+      parsed <- tryCatch(
+        as.character(utils::read.csv(text = body, header = FALSE,
+          check.names = FALSE, stringsAsFactors = FALSE)[1, ]),
+        error = function(e) trimws(strsplit(body, ",")[[1]]))
+      if (length(parsed) == ncol(df)) {
+        parsed <- trimws(parsed)
+        parsed[is.na(parsed)] <- ""   # empty unit fields parse as NA
+        return(parsed)
+      }
+    }
+    if (!is.null(fi)) {
+      fb <- adv_fallback_units(fi, df)
+      if (!is.null(fb) && length(fb) == ncol(df)) return(fb)
+    }
+    NULL
+  }
+
+  # Append units to the (read-only) column headers for display, e.g.
+  # "Ti (Kelvin)". Units are taken from the captured header / fallback. The
+  # underlying stored data frame keeps clean names — strip_header_units()
+  # (in wizard_helpers.R) reverses this after an edit.
+  adv_apply_header_units <- function(df, fi = NULL) {
+    if (is.null(df) || !is.data.frame(df) || ncol(df) == 0) return(df)
+    units <- adv_units_vector(df, fi)
+    if (is.null(units)) return(df)
+    nm <- names(df)
+    new_nm <- vapply(seq_along(nm), function(k) {
+      u <- units[k]
+      if (!is.na(u) && nzchar(u)) paste0(nm[k], " (", u, ")") else nm[k]
+    }, character(1))
+    # Preserve attributes (units header) across the rename.
+    uh <- attr(df, "siacs_units_header")
+    names(df) <- new_nm
+    if (!is.null(uh)) attr(df, "siacs_units_header") <- uh
+    df
+  }
+
   # Render tabs for preview (single or multi-sheet) - WITH EDIT CAPTURE
   # FIX: each file uses its own unique table ID ("table_advanced_{i}") instead
   # of the shared "table_advanced" ID.  The old shared ID caused every file's
@@ -251,7 +390,7 @@ advanced_module_server <- function(input, output, session, get_duration,
         local({
           sheet_name <- sheet
           output[[paste0("table_", i, "_", sheet_name)]] <- renderRHandsontable({
-            rhandsontable(df_list[[sheet_name]], readOnly = read_only)
+            rhandsontable(adv_apply_header_units(df_list[[sheet_name]]), readOnly = read_only)
           })
         })
       })
@@ -277,6 +416,8 @@ advanced_module_server <- function(input, output, session, get_duration,
           if (is.null(df_current) || (is.list(df_current) && !is.data.frame(df_current))) {
             df_current <- df_list  # fall back to the closure copy
           }
+          # Show units in the (read-only) column headers, e.g. "Ti (Kelvin)".
+          df_current <- adv_apply_header_units(df_current, fi)
           rhandsontable(df_current, readOnly = read_only)
         })
       })
@@ -290,6 +431,31 @@ advanced_module_server <- function(input, output, session, get_duration,
           observeEvent(input[[tid]], {
             req(input[[tid]])
             edited_df <- hot_to_r(input[[tid]])
+
+            # The displayed headers carry unit suffixes like "Ti (Kelvin)".
+            # Strip them so the stored data frame keeps clean column names.
+            edited_df <- strip_header_units(edited_df)
+
+            # hot_to_r() returns a fresh data frame, dropping the
+            # "siacs_units_header" attribute set by read_data(). Restore it
+            # from whatever is currently stored for this slot so the units
+            # line survives edit → snapshot. (Bug fix: editing Physical
+            # Environment / Outdoor Concentrations used to drop the units
+            # header and risk misaligning the Uncertainty row.)
+            restore_units_attr <- function(new_df) {
+              if (is.null(attr(new_df, "siacs_units_header"))) {
+                for (prefix in c("data", "data_online", "data_preload", "data_create")) {
+                  cur <- data_list_advanced[[paste0(prefix, fi)]]
+                  uh  <- if (!is.null(cur)) attr(cur, "siacs_units_header") else NULL
+                  if (!is.null(uh)) {
+                    attr(new_df, "siacs_units_header") <- uh
+                    break
+                  }
+                }
+              }
+              new_df
+            }
+            edited_df <- restore_units_attr(edited_df)
 
             # Normalize pre-transition rows for schedules that use step-change
             # semantics. Only insert a pre-row (at t - 0.1 min) in FRONT of
@@ -314,6 +480,7 @@ advanced_module_server <- function(input, output, session, get_duration,
                   insert_pretransitions_for_edits(edited_df, stored_df, trans = 0.1),
                   error = function(e) { warning(e); edited_df }
                 )
+                edited_df <- restore_units_attr(edited_df)
               }
             }
 
@@ -1207,8 +1374,10 @@ advanced_module_server <- function(input, output, session, get_duration,
               openxlsx::saveWorkbook(wb, out_path, overwrite = TRUE)
             }
           } else {
-            # CSV (the common case): write without row names
-            write.csv(df, out_path, row.names = FALSE)
+            # CSV (the common case): write with units header preserved, or a
+            # file-type default units line when the table was generated/edited
+            # in the GUI and has no captured header.
+            write_data_csv(df, out_path, fallback_units = adv_fallback_units(i, df))
           }
           files_written <- c(files_written, file_name)
           cat("  Written:", file_name, "\n")
@@ -1428,4 +1597,131 @@ advanced_module_server <- function(input, output, session, get_duration,
   observeEvent(input$advanced_open_trigger, {
     reset_advanced_to_blank()
   }, ignoreNULL = TRUE, ignoreInit = TRUE)
+
+  # =========================================================================
+  # EVENT ADDITION (parity with the Wizard's step-change events)
+  # =========================================================================
+  # The Advanced module previously only let users hand-edit the preview table.
+  # This adds a contextual "Add Event" panel for schedule-type files so users
+  # can insert a bounded step change (start time, value, optional end time)
+  # exactly like the Wizard. Supported files:
+  #   3  = Physical Environment   (wide; row 1 is an Uncertainty row)
+  #   5  = Activities             (wide; no uncertainty row)
+  #   17 = Artificial Light Schedule (wide; no uncertainty row)
+  adv_event_supported <- c(3L, 5L, 17L)
+
+  # Resolve the currently-previewed file's stored data frame (priority order).
+  adv_get_current_df <- function(fi) {
+    for (prefix in c("data", "data_online", "data_preload", "data_create")) {
+      d <- data_list_advanced[[paste0(prefix, fi)]]
+      if (!is.null(d)) return(d)
+    }
+    NULL
+  }
+  # Store back into the same slot the data came from.
+  adv_set_current_df <- function(fi, new_df) {
+    for (prefix in c("data", "data_online", "data_preload", "data_create")) {
+      key <- paste0(prefix, fi)
+      if (!is.null(data_list_advanced[[key]])) {
+        data_list_advanced[[key]] <- new_df
+        return(invisible(TRUE))
+      }
+    }
+    invisible(FALSE)
+  }
+
+  # Apply a windowed event to a wide schedule data frame, preserving any
+  # leading "Uncertainty" row (Physical Environment) and the units header
+  # attribute. Returns the updated data frame.
+  adv_apply_event_to_df <- function(df, col, t_start, new_val, t_end, trans = 0.1) {
+    units_attr <- attr(df, "siacs_units_header")
+    # Separate an Uncertainty row if present (Physical Environment).
+    has_unc <- nrow(df) > 0 && as.character(df[[1]][1]) == "Uncertainty"
+    unc_row <- NULL
+    work    <- df
+    if (has_unc) {
+      unc_row <- df[1, , drop = FALSE]
+      work    <- df[-1, , drop = FALSE]
+    }
+    # Coerce the working frame to numeric Time + numeric value columns so the
+    # step-change math works (preview tables can arrive as character).
+    work[[1]] <- suppressWarnings(as.numeric(as.character(work[[1]])))
+    names(work)[1] <- "Time"
+    work <- work[!is.na(work$Time), , drop = FALSE]
+    if (col %in% names(work))
+      work[[col]] <- suppressWarnings(as.numeric(as.character(work[[col]])))
+
+    updated <- insert_event_window_wide(work, col, t_start, new_val, t_end, trans)
+
+    # Reattach the uncertainty row on top, if there was one.
+    if (has_unc && !is.null(unc_row)) {
+      names(unc_row)[1] <- "Time"
+      # Align columns (in case insert added none) and rbind as character-safe.
+      common <- intersect(names(unc_row), names(updated))
+      updated_chr <- updated
+      out <- rbind(
+        setNames(as.data.frame(lapply(unc_row[common], as.character),
+                               stringsAsFactors = FALSE), common),
+        setNames(as.data.frame(lapply(updated_chr[common], as.character),
+                               stringsAsFactors = FALSE), common)
+      )
+      updated <- out
+    }
+    if (!is.null(units_attr)) attr(updated, "siacs_units_header") <- units_attr
+    updated
+  }
+
+  # Render the contextual event panel based on the file being previewed.
+  output$adv_event_panel <- renderUI({
+    fi <- current_file_index()
+    if (is.null(fi) || !(fi %in% adv_event_supported)) return(NULL)
+    df <- adv_get_current_df(fi)
+    if (is.null(df) || !is.data.frame(df) || ncol(df) < 2) return(NULL)
+
+    # Candidate value columns = all columns except the Time column.
+    value_cols <- names(df)[-1]
+    title <- titles_advanced[fi]
+
+    div(style = "background:#eef6fb;border:1px solid #bee5eb;border-radius:6px;padding:10px 12px;margin-bottom:10px;",
+      tags$b(sprintf("Add Event \u2014 %s", title)),
+      p(style = "color:#555;font-size:11px;margin:4px 0 8px 0;",
+        "Insert a bounded step change. Set a start time and value; optionally ",
+        "set an end time to return the variable to its previous value then. ",
+        "Leave end time blank for an open-ended change."),
+      fluidRow(
+        column(3, selectInput("adv_event_col", "Column", choices = value_cols)),
+        column(2, numericInput("adv_event_start", "Start (min)", value = 0, min = 0)),
+        column(2, numericInput("adv_event_end", "End (min, optional)", value = NA, min = 0)),
+        column(2, numericInput("adv_event_value", "New value", value = 0)),
+        column(3, div(style = "padding-top:25px;",
+          actionButton("adv_event_add", "Add Event",
+            style = "background:#E67E22;color:#fff;width:100%;")))
+      )
+    )
+  })
+
+  observeEvent(input$adv_event_add, {
+    fi <- current_file_index()
+    req(fi, fi %in% adv_event_supported,
+        input$adv_event_col, input$adv_event_start, input$adv_event_value)
+    df <- adv_get_current_df(fi)
+    if (is.null(df) || !is.data.frame(df)) {
+      showNotification("No data loaded for this file — preload or upload first.",
+                       type = "warning", duration = 4)
+      return()
+    }
+    updated <- tryCatch(
+      adv_apply_event_to_df(df, input$adv_event_col,
+                            input$adv_event_start, input$adv_event_value,
+                            input$adv_event_end, trans = 0.1),
+      error = function(e) { showNotification(paste("Could not add event:",
+                            conditionMessage(e)), type = "error", duration = 5); NULL })
+    if (is.null(updated)) return()
+    adv_set_current_df(fi, updated)
+    # Clear the stale validation result so the user re-validates the new data.
+    validation_results[[paste0("result_", fi)]] <- NULL
+    showNotification(sprintf("Event added to %s (%s).",
+                             titles_advanced[fi], input$adv_event_col),
+                     type = "message", duration = 3)
+  })
 }

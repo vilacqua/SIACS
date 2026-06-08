@@ -51,12 +51,17 @@ insert_step_change_wide <- function(df, col, t, new_val, trans = 0.1) {
   }
   df <- df[order(df$Time), ]
 
-  # Value of col just before the event (last row with Time <= t)
-  before_rows <- df[df$Time <= t, ]
-  prev_val    <- if (nrow(before_rows) > 0) tail(before_rows[[col]], 1) else 0
+  # Value of col just BEFORE the event. Use strictly-less-than so that if a row
+  # already sits exactly at t (e.g. from a prior event), we capture the value
+  # that preceded it rather than that row's own value — otherwise stacking a
+  # second event on the same time would treat the first event's value as the
+  # pre-jump baseline.
+  before_strict <- df[df$Time < t, ]
+  prev_val    <- if (nrow(before_strict) > 0) tail(before_strict[[col]], 1) else 0
 
-  # Pre-event row (only if t > 0; a transition before t=0 is meaningless)
-  last_before   <- if (nrow(before_rows) > 0) tail(before_rows, 1) else df[1, ]
+  # Full row to clone for new rows: prefer the row strictly before t; fall back
+  # to the first row when the event is at/before the start of the schedule.
+  last_before   <- if (nrow(before_strict) > 0) tail(before_strict, 1) else df[1, ]
 
   # Event row
   new_at        <- last_before
@@ -68,6 +73,12 @@ insert_step_change_wide <- function(df, col, t, new_val, trans = 0.1) {
     new_pre        <- last_before
     new_pre$Time   <- t_pre
     new_pre[[col]] <- prev_val   # unchanged value right before the jump
+    # BUG FIX: if rows already exist at exactly t_pre or t, drop them FIRST so
+    # the freshly-built event rows win. Previously we appended the new rows and
+    # then used !duplicated(Time), which keeps the FIRST occurrence — i.e. the
+    # stale pre-existing row — silently discarding the new event value whenever
+    # the event time coincided with an existing schedule point.
+    df <- df[!(df$Time %in% c(t_pre, t)), , drop = FALSE]
     df <- rbind(df, new_pre, new_at)
     df <- df[order(df$Time), ]
     df <- df[!duplicated(df$Time), ]
@@ -89,6 +100,10 @@ insert_step_change_two_col <- function(df, t, new_val, trans = 0.1) {
   # time from t=0 would produce a negative time, which is meaningless.
   if (t > 0) {
     t_pre <- t - max(trans, 0.001)
+    # BUG FIX: drop existing rows at exactly t_pre / t first so the new event
+    # rows win deduplication (otherwise !duplicated keeps the stale row and the
+    # new value is silently discarded when the event lands on an existing time).
+    df <- df[!(df$Time %in% c(t_pre, t)), , drop = FALSE]
     df <- rbind(df,
       data.frame(Time = t_pre, Value = prev_val, stringsAsFactors = FALSE),
       data.frame(Time = t,     Value = new_val,  stringsAsFactors = FALSE))
@@ -99,6 +114,231 @@ insert_step_change_two_col <- function(df, t, new_val, trans = 0.1) {
     df[df$Time == 0, "Value"] <- new_val
   }
   rownames(df) <- NULL
+  df
+}
+
+# -----------------------------------------------------------------------
+# WINDOWED-EVENT HELPERS (event with an explicit END time)
+# -----------------------------------------------------------------------
+# A plain step change sets a value at time t that persists until the next
+# existing time point or the end of the simulation. That causes events to
+# "run too long" when the user only wants them active for a bounded window.
+#
+# These helpers add an event that turns ON at t_start (value = new_val) and
+# automatically returns to the value that was in effect just BEFORE the
+# event (the baseline) at t_end. Each edge gets its own pre-transition row
+# so the change is a sharp step rather than a linear ramp.
+#
+# If t_end is NULL/NA/<= t_start, the behaviour falls back to a plain
+# open-ended step change (backwards compatible with the old buttons).
+
+# Wide format (light schedule, physical environment).
+#
+# For a bounded event [t_start, t_end] we must ensure the event value holds
+# across the ENTIRE window, not just at the boundary rows. Any pre-existing
+# schedule points that fall strictly inside the window would otherwise
+# interrupt the event (e.g. a default hourly point at t=60 inside a 56–106
+# window pulls the value back down). We handle this by overwriting the target
+# column to new_val for every existing row inside the open interval
+# (t_start, t_end). Other columns in those rows are left untouched.
+insert_event_window_wide <- function(df, col, t_start, new_val, t_end = NULL,
+                                      trans = 0.1) {
+  # Capture the baseline value — the value in effect STRICTLY BEFORE t_start —
+  # BEFORE we mutate df, so the "return to baseline" at t_end is correct even
+  # if the window lies between existing schedule points. Using strictly-before
+  # (Time < t_start, not <=) matters when a prior event already placed a row
+  # exactly at t_start: we want the value that preceded that event, not the
+  # event's own value. (Fixes: Time On then Time Off on the same window left
+  # the first event's value behind at t_end instead of the true baseline.)
+  df0 <- df[order(df$Time), ]
+  before_rows <- df0[df0$Time < t_start, ]
+  baseline <- if (nrow(before_rows) > 0 && col %in% names(df0))
+    tail(before_rows[[col]], 1) else 0
+
+  bounded <- !is.null(t_end) && !is.na(t_end) && t_end > t_start
+
+  # Turn ON at t_start
+  df <- insert_step_change_wide(df, col, t_start, new_val, trans)
+
+  if (bounded) {
+    # Overwrite the target column for any existing rows strictly inside the
+    # window so intermediate schedule points don't interrupt the event.
+    if (col %in% names(df)) {
+      inside <- df$Time > t_start & df$Time < t_end
+      if (any(inside)) df[inside, col] <- new_val
+    }
+    # Turn OFF (return to baseline) at t_end.
+    df <- insert_step_change_wide(df, col, t_end, baseline, trans)
+  }
+  df
+}
+
+# Two-column (Time / Value) — activity schedule.
+insert_event_window_two_col <- function(df, t_start, new_val, t_end = NULL,
+                                        trans = 0.1) {
+  df0 <- df[order(df$Time), ]
+  before_rows <- df0[df0$Time < t_start, ]    # strictly before — see note above
+  baseline <- if (nrow(before_rows) > 0) tail(before_rows$Value, 1) else 0
+
+  bounded <- !is.null(t_end) && !is.na(t_end) && t_end > t_start
+
+  df <- insert_step_change_two_col(df, t_start, new_val, trans)
+
+  if (bounded) {
+    # Hold the event value across the whole window: overwrite the value of any
+    # existing rows strictly inside (t_start, t_end) so they don't interrupt.
+    inside <- df$Time > t_start & df$Time < t_end
+    if (any(inside)) df[inside, "Value"] <- new_val
+    # Return to baseline at t_end.
+    df <- insert_step_change_two_col(df, t_end, baseline, trans)
+  }
+  df
+}
+
+# -----------------------------------------------------------------------
+# UNCERTAINTY-ROW PREPENDER
+# -----------------------------------------------------------------------
+# SIACS requires Physical Environment and Outdoor Concentration data to carry
+# an "Uncertainty" row as the FIRST data row (right after the header). The
+# engine's ExtractUncertainty() reads x[1, -1] as per-column uncertainty and
+# x[-1, ] as the actual time series. Manually-entered wizard schedules are
+# generated WITHOUT this row, so the engine silently drops the first time
+# point (and the assembly check flags an error). This helper prepends a
+# correctly-shaped uncertainty row when one is not already present.
+#
+#   df        : data frame with a leading Time column
+#   defaults  : named list mapping column name -> default uncertainty value;
+#               any column not listed uses `fallback`.
+#   fallback  : uncertainty for unlisted columns (default 0 = no uncertainty)
+#
+# Returns df unchanged if it already starts with an "Uncertainty" row.
+prepend_uncertainty_row <- function(df, defaults = list(), fallback = 0) {
+  if (is.null(df) || !is.data.frame(df) || nrow(df) == 0) return(df)
+  time_col <- names(df)[1]
+  # Already has an uncertainty row?
+  if (identical(as.character(df[[time_col]][1]), "Uncertainty")) return(df)
+
+  unc <- df[1, , drop = FALSE]          # clone structure
+  unc[[time_col]] <- "Uncertainty"
+  for (col in names(df)[-1]) {
+    val <- if (!is.null(defaults[[col]])) defaults[[col]] else fallback
+    unc[[col]] <- val
+  }
+  # Time column must be character to hold "Uncertainty"; coerce so rbind keeps
+  # the label rather than turning it into NA.
+  df[[time_col]]  <- as.character(df[[time_col]])
+  unc[[time_col]] <- as.character(unc[[time_col]])
+  out <- rbind(unc, df)
+  rownames(out) <- NULL
+  out
+}
+
+# Per-variable default uncertainties for the Physical Environment schedule,
+# matching the absolute-uncertainty convention used in the default
+# PhysicalEnvironmentData_*.csv files (Ti/To in K, RH fraction, etc.).
+.siacs_phys_uncertainty_defaults <- list(
+  Ti = 0.1, To = 0.1, OpenWindowArea = 0,
+  QBal = 0.05, QUnbal = 0.05, QFilter = 0.05,
+  RH = 0.01, BP = 5, Wind = 0.05, SunFactor = 0
+)
+
+# -----------------------------------------------------------------------
+# LIVE-TABLE UNCERTAINTY ROW (display + edit split)
+# -----------------------------------------------------------------------
+# The wizard keeps Physical Environment / Outdoor Concentration schedules as
+# purely numeric data frames internally (so sorting and event math work). To
+# let the user SEE and EDIT the uncertainty values in the live rhandsontable,
+# we splice an "Uncertainty" row on top for display, then split it back out on
+# every edit. The numeric schedule and the one-row uncertainty data frame are
+# stored separately in wizard_state.
+
+# Build a one-row uncertainty data frame matching `schedule`'s columns.
+make_default_uncertainty_row <- function(schedule, defaults = list(), fallback = 0) {
+  time_col <- names(schedule)[1]
+  row <- schedule[1, , drop = FALSE]
+  row[[time_col]] <- "Uncertainty"
+  for (col in names(schedule)[-1]) {
+    row[[col]] <- if (!is.null(defaults[[col]])) defaults[[col]] else fallback
+  }
+  rownames(row) <- NULL
+  row
+}
+
+# Combine an uncertainty row + numeric schedule into one character data frame
+# for display in the live table. The uncertainty row is always first.
+combine_with_uncertainty <- function(schedule, unc_row) {
+  if (is.null(schedule)) return(NULL)
+  if (is.null(unc_row))  return(schedule)
+  time_col <- names(schedule)[1]
+  common   <- intersect(names(unc_row), names(schedule))
+  out <- rbind(
+    setNames(as.data.frame(lapply(unc_row[common],  as.character), stringsAsFactors = FALSE), common),
+    setNames(as.data.frame(lapply(schedule[common], as.character), stringsAsFactors = FALSE), common)
+  )
+  rownames(out) <- NULL
+  out
+}
+
+# Split a combined (edited) table back into list(uncertainty=<1-row df>,
+# schedule=<numeric df>). If no Uncertainty row is present, uncertainty is NULL.
+split_uncertainty <- function(df) {
+  if (is.null(df) || nrow(df) == 0) return(list(uncertainty = NULL, schedule = df))
+  time_col <- names(df)[1]
+  is_unc   <- as.character(df[[time_col]]) == "Uncertainty"
+  unc_row  <- NULL
+  if (any(is_unc)) {
+    unc_row <- df[which(is_unc)[1], , drop = FALSE]
+    df      <- df[!is_unc, , drop = FALSE]
+  }
+  # Coerce remaining schedule columns back to numeric.
+  for (col in names(df)) df[[col]] <- suppressWarnings(as.numeric(as.character(df[[col]])))
+  df <- df[!is.na(df[[time_col]]), , drop = FALSE]
+  rownames(df) <- NULL
+  list(uncertainty = unc_row, schedule = df)
+}
+
+# -----------------------------------------------------------------------
+# COLUMN-HEADER UNITS (live tables)
+# -----------------------------------------------------------------------
+# Mirrors the "Duration (hours)" labelling used elsewhere in the wizard by
+# appending units to the live-table column HEADERS for display only. The
+# underlying data frame keeps clean column names (Ti, To, ...) so the engine
+# and all downstream code are unaffected. apply_header_units() renames for
+# display; strip_header_units() reverses it after an edit.
+
+# clean column name -> unit string (no parentheses)
+.siacs_phys_units <- c(
+  Time = "min", Ti = "Kelvin", To = "Kelvin", OpenWindowArea = "m2",
+  QBal = "m3/s", QUnbal = "m3/s", QFilter = "m3/s",
+  RH = "[0,1]", BP = "Pascal", Wind = "m/s", SunFactor = "[0,1]"
+)
+
+# Rename a data frame's columns to "Name (unit)" for display. `units` is a
+# named character vector mapping clean column name -> unit; columns not in
+# `units` are left unchanged. For species tables (outdoor concentrations) a
+# single `default_unit` applies to every non-Time column.
+apply_header_units <- function(df, units = NULL, default_unit = NULL) {
+  if (is.null(df) || ncol(df) == 0) return(df)
+  nm <- names(df)
+  new_nm <- vapply(nm, function(col) {
+    u <- NULL
+    if (!is.null(units) && col %in% names(units)) {
+      u <- units[[col]]
+    } else if (!is.null(default_unit) && col != names(df)[1]) {
+      u <- default_unit
+    }
+    if (!is.null(u) && nzchar(u)) paste0(col, " (", u, ")") else col
+  }, character(1), USE.NAMES = FALSE)
+  names(df) <- new_nm
+  df
+}
+
+# Reverse apply_header_units(): strip a trailing " (unit)" from each column
+# name so the stored data frame keeps clean names. Safe to call on names that
+# have no unit suffix.
+strip_header_units <- function(df) {
+  if (is.null(df) || ncol(df) == 0) return(df)
+  names(df) <- sub("\\s*\\([^)]*\\)\\s*$", "", names(df))
   df
 }
 
@@ -288,8 +528,16 @@ ensure_step_transitions <- function(df, trans = 0.1) {
 # last row *above* that position which had a fully-populated value for that
 # column.  It also removes any rows where the Time cell is NA (blank rows
 # that rhandsontable can create when a row is right-click-deleted).
+#
+# step_transitions: when TRUE, also re-derive pre-transition rows via
+# ensure_step_transitions() so every value change becomes a sharp step.
+# This is only appropriate for schedules driven by discrete step-change
+# EVENTS (ventilation, lights, activities). It must be FALSE (the default)
+# for directly-edited or loaded schedules that contain smoothly-varying
+# data — otherwise it turns continuous CMAQ temperature/wind series into a
+# staircase and injects spurious 59.9/119.9/... rows before every hour.
 # -----------------------------------------------------------------------
-fill_schedule_gaps <- function(df) {
+fill_schedule_gaps <- function(df, step_transitions = FALSE) {
   if (is.null(df) || nrow(df) == 0) return(df)
 
   # Drop rows where Time is NA (blank rows left by rhandsontable delete)
@@ -320,11 +568,11 @@ fill_schedule_gaps <- function(df) {
     }
   }
 
-  # Always normalize pre-transition rows so final-value steps get their
-  # transition too (the explicit insert_step_change_* helpers only add a
-  # pre-row in front of the event they touched; the initial endpoint and
-  # any subsequent direct edits are handled here).
-  df <- ensure_step_transitions(df, trans = 0.1)
+  # Only force step-transition rows when explicitly requested (discrete-event
+  # schedules). Direct edits / loaded continuous data are left untouched.
+  if (isTRUE(step_transitions)) {
+    df <- ensure_step_transitions(df, trans = 0.1)
+  }
 
   df
 }
@@ -815,7 +1063,22 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
         input$wiz_activity_transition %||% 0.1)
     }
     phys_file <- inp_path("PhysicalEnvironmentData.csv")
-    write.csv(phys_env, phys_file, row.names=FALSE)
+    # Manual schedules are stored numeric-only; the editable uncertainty row
+    # lives separately in wizard_state$phys_uncertainty. Use the user's edited
+    # uncertainties if present, otherwise fall back to per-variable defaults.
+    phys_unc <- if (!is.null(wizard_state$phys_uncertainty))
+      wizard_state$phys_uncertainty else NULL
+    if (!is.null(phys_unc)) {
+      phys_env <- combine_with_uncertainty(phys_env, phys_unc)
+    } else {
+      phys_env <- prepend_uncertainty_row(phys_env,
+        defaults = .siacs_phys_uncertainty_defaults, fallback = 0)
+    }
+    # Units header for the Physical Environment file.
+    phys_units <- c("min","Kelvin","Kelvin","m2","m3/s","m3/s","m3/s",
+                    "[0,1]","Pascal","m/s")
+    write_csv_with_units(phys_env, phys_file,
+      units_row = if (ncol(phys_env) == length(phys_units)) phys_units else NULL)
     run_assembly_check(phys_env, "PhysicalEnvironment", "Physical Environment",
       duration_hours = input$wiz_duration %||% 27)
     files_created$PhysicalEnvironment <- phys_file
@@ -884,11 +1147,22 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
 
   if (oc_mode == "Manual entry" && !is.null(wizard_state$outdoor_manual)) {
     oc_file <- inp_path("OutdoorConcentrations.csv")
-    write.csv(wizard_state$outdoor_manual, oc_file, row.names=FALSE)
-    run_assembly_check(wizard_state$outdoor_manual, "OutdoorConcentrations",
+    # Use the user's edited uncertainty row if present, else default 0.05.
+    oc_unc <- if (!is.null(wizard_state$outdoor_uncertainty))
+      wizard_state$outdoor_uncertainty else NULL
+    oc_data <- if (!is.null(oc_unc)) {
+      combine_with_uncertainty(wizard_state$outdoor_manual, oc_unc)
+    } else {
+      prepend_uncertainty_row(wizard_state$outdoor_manual,
+        defaults = list(), fallback = 0.05)
+    }
+    # Units header: Time has no unit; every species column is ppm.
+    oc_units <- c("min", rep("ppm", ncol(oc_data) - 1))
+    write_csv_with_units(oc_data, oc_file, units_row = oc_units)
+    run_assembly_check(oc_data, "OutdoorConcentrations",
       "Outdoor Concentrations", duration_hours = input$wiz_duration %||% 27)
     files_created$OutdoorConcentrations <- oc_file
-    update_input_list("OutdoorConcentrations", wizard_state$outdoor_manual)
+    update_input_list("OutdoorConcentrations", oc_data)
 
   } else if (oc_mode == "Upload custom file") {
     req_file <- input$wiz_outdoor_conc_file
@@ -930,7 +1204,9 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
       df <- tryCatch(read.csv(src, stringsAsFactors=FALSE, comment.char="#"), error=function(e) NULL)
       if (!is.null(df)) {
         dest <- inp_path(basename(src))
-        write.csv(df, dest, row.names=FALSE)
+        # Copy the file verbatim so the units comment line and Uncertainty row
+        # are preserved exactly (read.csv+write.csv would drop the units line).
+        file.copy(src, dest, overwrite = TRUE)
         files_created$PhysicalEnvironment <- dest
         update_input_list("PhysicalEnvironment", df)
       }
@@ -944,7 +1220,7 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
       df <- tryCatch(read.csv(src, stringsAsFactors=FALSE, comment.char="#"), error=function(e) NULL)
       if (!is.null(df)) {
         dest <- inp_path(basename(src))
-        write.csv(df, dest, row.names=FALSE)
+        file.copy(src, dest, overwrite = TRUE)
         files_created$Activities <- dest
         update_input_list("Activities", df)
       }
@@ -958,7 +1234,7 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
       df <- tryCatch(read.csv(src, stringsAsFactors=FALSE, comment.char="#"), error=function(e) NULL)
       if (!is.null(df)) {
         dest <- inp_path(basename(src))
-        write.csv(df, dest, row.names=FALSE)
+        file.copy(src, dest, overwrite = TRUE)
         files_created$OutdoorConcentrations <- dest
         update_input_list("OutdoorConcentrations", df)
       }

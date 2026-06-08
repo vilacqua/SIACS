@@ -195,3 +195,49 @@ siacs_ensure_packages_installed <- function(pkgs, log_file = NULL) {
   }
   invisible(still_missing)
 }
+
+# -----------------------------------------------------------------------
+# WRITABLE WORKSPACE
+# -----------------------------------------------------------------------
+# SIACS must never write into its own install directory: that triggers
+# Windows administrator-approval prompts when installed under Program Files
+# or any folder guarded by Controlled Folder Access (which protects
+# Documents/Desktop even on C:). All runtime artifacts — diagnostic logs,
+# per-instance run logs, Input_*/Output_* folders — go here instead.
+#
+# Resolution order (first writable wins):
+#   1. env var SIACS_WORKSPACE
+#   2. R option "SIACS.workspace"
+#   3. tools::R_user_dir("SIACS", "data")/workspace   (always user-writable)
+#   4. tempdir()/SIACS-workspace                      (last-resort fallback)
+siacs_workspace_dir <- function(create = TRUE) {
+  is_writable <- function(d) {
+    if (is.null(d) || !nzchar(d)) return(FALSE)
+    if (!dir.exists(d)) {
+      ok <- dir.create(d, recursive = TRUE, showWarnings = FALSE)
+      if (!ok) return(FALSE)
+    }
+    # Probe with a temp file to confirm we can actually write.
+    probe <- file.path(d, paste0(".siacs_write_test_", Sys.getpid()))
+    ok <- tryCatch({ file.create(probe); TRUE },
+                   error = function(e) FALSE, warning = function(w) FALSE)
+    if (isTRUE(ok)) unlink(probe, force = TRUE)
+    isTRUE(ok)
+  }
+
+  candidates <- c(
+    Sys.getenv("SIACS_WORKSPACE", ""),
+    getOption("SIACS.workspace", ""),
+    tryCatch(file.path(tools::R_user_dir("SIACS", "data"), "workspace"),
+             error = function(e) ""),
+    file.path(tempdir(), "SIACS-workspace")
+  )
+  for (cand in candidates) {
+    if (nzchar(cand) && is_writable(cand))
+      return(normalizePath(cand, winslash = "/", mustWork = FALSE))
+  }
+  # Should never reach here (tempdir is always writable), but be safe.
+  d <- file.path(tempdir(), "SIACS-workspace")
+  if (isTRUE(create)) dir.create(d, recursive = TRUE, showWarnings = FALSE)
+  normalizePath(d, winslash = "/", mustWork = FALSE)
+}

@@ -2,406 +2,383 @@
 
 ## Overview
 
-**SIACS** (Simulation of Indoor Air Chemistry and Surfaces) is an ODE-based single-zone (well-mixed) indoor air box model. It simulates time-varying indoor concentrations by jointly accounting for:
-
-- Gas-phase photochemistry using SAPRC mechanisms (`SAPRC99`, `SAPRC07T`)
-- Ventilation (infiltration, balanced, unbalanced, natural)
-- Surface deposition and filtration
-- Indoor emissions linked to activity schedules
-- Indoor photolysis rates ("J-values") derived from outdoor solar and indoor lighting
-- Optional post-processing: time derivatives, mass balance components, sensitivity, uncertainty
-
-SIACS supports two user workflows:
-
-- **Interactive GUI** (Shiny), launched with `runSIACSApp()`
-- **Batch mode** for scripting and multi-scenario runs, via `SIACS.batch()`
-
-## Why you might use SIACS
-
-Indoor pollutant levels are influenced by multiple drivers that change over time, including ventilation, outdoor air, indoor sources, and removal to surfaces or filters. When chemistry is enabled, reactions can couple those drivers in ways that are hard to reason about without a dynamical model.
-
-SIACS is a practical middle ground between:
-
-- simple steady-state calculations that cannot represent time-varying behavior, and
-- highly detailed modeling frameworks that require extensive inputs and specialized configuration.
-
-It is intended for scenario exploration ("what if" studies), hypothesis building, and sensitivity-style comparisons (e.g., how much does changing air exchange or a source schedule shift indoor concentrations).
-
-When running chemistry, SIACS uses SAPRC-based mechanisms (selectable via `mechanism`) with a fixed reaction set (on the order of ~211 reactions) and a mechanism-defined set of species/groups.
-
-## What the package provides
-
-- A core simulation engine (`SIACS()`) that solves a coupled ODE system.
-- A batch runner (`SIACS.batch()`) that prepares inputs, computes lighting if needed, runs one or more scenarios, and writes outputs.
-- A Shiny interface (`runSIACSApp()`) that helps you configure scenarios interactively.
-
-The package includes bundled example inputs and templates (see `system.file("extdata", "Input", package = "SIACS")`) that you can copy and modify.
-
-## Who this is for
-
-- Users who want a reproducible, scriptable way to simulate indoor concentration time series.
-- Users who prefer a GUI for building and running scenarios.
-- Users comparing relative effects of interventions (ventilation, filtration, emissions, light) under a defined set of assumptions.
-
-## When SIACS may not fit
-
-SIACS is a single-zone reduced-form model. Consider a different approach if you need:
-
-- multi-room airflow networks or CFD
-- detailed heterogeneous/multiphase chemistry beyond the current scope
-- tightly coupled building energy/HVAC control simulation
-- decision-grade predictions without case-specific validation for your application
-
-## Installation
-
-### From a local source tarball
-
-```r
-# Install from a local source tarball (e.g., provided by a collaborator):
-install.packages("path/to/SIACS_0.2.0.tar.gz", repos = NULL, type = "source")
-```
-
-Once on CRAN (recommended for most users):
-```r
-install.packages("SIACS")
-```
-
-For developers (install from a local package folder):
-```r
-devtools::install("path/to/SIACS_cran", upgrade = "never")
-```
-
-## Quick Start
-
-### GUI Mode (recommended for new users)
-
-```r
-SIACS::runSIACSApp()
-```
-
-In the app you can:
-
-- Use **Wizard Mode** for a guided, step-by-step setup (defaults are pre-populated from the bundled example scenario)
-- Use **Advanced Mode** to upload/edit full CSV/XLSX inputs directly
-
-### Option B: Batch mode (scripting)
-
-At a high level, batch mode requires:
-
-- A named `input_data_list` holding all required input tables per scenario
-- An `instances` vector indicating which scenarios to run
-- An `OutputList` describing output file paths and optional analyses
-
-```r
-library(SIACS)
-
-results <- SIACS.batch(
-  input_data_list = my_input_data_list,
-  instances       = 1,
-  OutputList      = my_output_list,
-  mechanism       = "SAPRC99",
-  chemistry       = TRUE,
-  use_parallel    = FALSE
-)
-
-out <- results[[1]]$Simulation1$alldata
-head(out[, c("time", "O3", "NO2", "HCHO")])
-```
-
-## Conceptual model (what SIACS simulates)
-
-SIACS solves mass-balance ODEs for all tracked species in a single indoor zone.
-
-The governing processes include:
-
-- **Ventilation exchange** with outdoors (species-specific penetration may apply)
-- **Indoor sources** (emission profiles activated by time-varying activities)
-- **Surface loss** via deposition velocities (optionally activity dependent)
-- **Removal via filtration** (HVAC / recirculating filters)
-- **Gas-phase chemistry** including photolysis, with indoor photolysis rates computed from the indoor light environment
-
-The ODE system is solved using `deSolve::lsode()` with a user-supplied Jacobian.
-
-## Core equations and concepts
-
-This section summarizes a standard single-zone indoor mass-balance formulation to make the model structure more transparent. It is intended to help you reason about inputs/outputs and design scenarios; it is not a full derivation.
-
-### Mass balance (single-zone box model)
-
-SIACS follows a mass-conservation formulation for each species *x*, combining outdoor exchange, indoor sources, chemistry, and deposition.
-
-A common way to write the conceptual balance is:
-
-```text
-dC_i,x/dt = (P_x * a) * C_o,x  -  a * C_i,x  +  S_x/V  -  (v_x * A/V) * C_i,x  -  Σ_n (k_n * ...)
-```
-
-Where the terms represent:
-
-- **`C_i,x`**: indoor concentration of species *x*
-- **`C_o,x`**: outdoor concentration of species *x*
-- **`P_x`**: penetration factor (dimensionless) describing fraction of outdoor species that penetrates indoors
-- **`a`**: air exchange rate (time⁻¹)
-- **`S_x`**: indoor emission rate (mass/time) for species *x*
-- **`V`**: indoor zone volume
-- **`A`**: effective indoor surface area available for deposition
-- **`v_x`**: deposition velocity (length/time) for species *x*
-- **`k_n`**: pseudo-first-order rate constant(s) representing chemical reactions (including photolysis where applicable)
-
-Notes:
-
-- SIACS tracks many species simultaneously, so chemistry terms are part of a coupled ODE system.
-- In practice, SIACS uses specific unit systems internally (e.g., molecules/cm³ for some solver states) and converts to user-facing units in outputs.
-
-### Ventilation / airflow components
-
-One way to conceptualize the total ventilation flow rate is as a combination of mechanical ventilation and envelope-driven components:
-
-```text
-Q_tot = Q_bal + sqrt(Q_unbal^2 + Q_nat^2 + Q_inf^2)
-```
-
-With infiltration parameterized (extended LBNL approach) as:
-
-```text
-Q_inf = A_inf * sqrt(k_s * |T_i - T_o| + k_w * U^2)
-```
-
-And natural ventilation as a combination of wind- and stack-driven terms:
-
-```text
-Q_nat = sqrt(Q_nat,wind^2 + Q_nat,stack^2)
-```
-
-Where:
-
-- **`Q_tot`**: total ventilation flow rate
-- **`Q_bal`**: balanced mechanical ventilation flow
-- **`Q_unbal`**: unbalanced mechanical ventilation flow
-- **`Q_nat`**: natural ventilation flow (windows/doors)
-- **`Q_inf`**: infiltration (leakage) flow (envelope cracks)
-- **`A_inf`**: effective leakage area
-- **`k_s`**: stack coefficient
-- **`k_w`**: wind coefficient
-- **`T_i`, `T_o`**: indoor and outdoor temperature
-- **`U`**: wind speed
-
-SIACS uses these flows (together with zone volume) to produce time-varying exchange rates that drive indoor–outdoor transport.
-
-### Time stepping, resolution, and interpolation
-
-- **Output resolution vs. solver steps**: you specify an output time grid (e.g., every minute), but the ODE solver may take smaller internal steps as needed for numerical convergence.
-- **Sparse time-series inputs are allowed**: as long as time-dependent inputs are defined at the simulation start and end, SIACS interpolates values as needed during integration.
-
-## Key assumptions and limitations
-
-SIACS is designed as a simplified screening-level tool. Important assumptions and limitations include:
-
-- **Single-zone, well-mixed indoor air**: the modeled space is assumed to be one well-mixed compartment.
-- **Gas-phase reactions only (current scope)**: the model is primarily formulated for gas-phase chemistry. Heterogeneous interactions (e.g., surface absorption/desorption and other multiphase chemistry) are not represented in the current model formulation.
-- **Chemistry mechanism is not user-editable via inputs**: chemical mechanism details are fixed by the selected mechanism (`SAPRC99` or `SAPRC07T`). Changes require code modification.
-- **Time-base differences**: many input time series are expressed in **minutes**, while the ODE solver time grid uses **seconds**.
-
-## Input data quality and recommended practices
-
-### Secondary data and “fit for use” checks
-
-SIACS scenarios are often built from secondary sources (published measurements, public datasets, or outputs from other models). Before relying on a dataset, apply basic “fit for use” checks that match the stakes of your application.
-
-Examples of checks you can apply:
-
-- **Applicability and utility** (relevance to the scenario being modeled)
-- **Soundness** (methods and conclusions supported by accepted scientific practice)
-- **Clarity and completeness** (assumptions and metadata sufficient to interpret and reproduce)
-- **Uncertainty and variability** (uncertainties described and not ignored)
-- **Evaluation and review** (peer review / independent technical review)
-- **Comparability** (ability to compare/merge across sources)
-
-### Minimal requirements for time-dependent inputs
-
-SIACS can work with limited data. However, for each time-dependent input variable:
-
-- Values should be provided at a minimum at the **start** and **end** of the simulation period.
-- SIACS interpolates time-dependent inputs internally using a monotonic spline approach; because interpolation does not inherently guarantee positivity, the implementation includes adjustments intended to ensure non-negativity.
-
-### Spin-up / initial conditions
-
-Initial indoor concentrations can be supplied directly, or estimated to reflect equilibrium at the simulation start. If you rely on internally-estimated equilibrium initial conditions, it is recommended to include a model **spin-up** period under constant conditions representative of the desired initial state. Spin-up time is typically longer under lower air exchange rates.
-
-## Main exported functions
-
-SIACS exports three primary user-facing functions (plus many internal helpers).
-
-### `runSIACSApp()`
-
-Launches the Shiny application.
-
-- **Use when** you want to explore the model interactively, build scenarios, and export output files without writing R code.
-- **Returns** no value (blocks while app runs).
-
-### `SIACS.batch()`
-
-Runs one or more independent scenarios programmatically (optionally in parallel).
-
-- **Use when** you want reproducible scripted runs, parameter sweeps, multiple scenarios, or to integrate SIACS into an automated workflow.
-- **Returns** an invisible list of per-instance result objects.
-- **Side effects** writes output CSV/XLSX/PNG files to the paths given in `OutputList`.
-
-Key arguments:
-
-- `input_data_list`: list of all inputs (each element is a list indexed by instance)
-- `instances`: which instance indices to run (e.g., `1:10`)
-- `OutputList`: output file paths and analysis toggles (use `"None"` to suppress)
-- `use_parallel`, `n_cores`: parallel execution controls
-- `mechanism`: `"SAPRC99"` or `"SAPRC07T"`
-- `chemistry`: `TRUE` for full chemistry, `FALSE` for physical-only
-- `perturbation`: `TRUE` to enable sensitivity/uncertainty analyses
-
-### `SIACS()` (core engine)
-
-Runs a single simulation given fully prepared input objects.
-
-- **Use when** you are developing new workflows or integrating SIACS deeply into custom code.
-- In most cases you should call **`SIACS.batch()`** or the **GUI** instead.
-
-## Input data: structure and required elements
-
-In batch mode, `input_data_list` is a **named list**, where each element is itself a **list of length = number of scenarios**.
-
-Minimum required elements (typical):
-
-- `Time`
-- `BoxData`
-- `PhysicalEnvironment`
-- `OutdoorConcentrations`
-- `EmissionProfiles`
-- `Activities`
-- `DepositionV`
-- `InitialValues`
-
-Additional elements are required if SIACS must compute indoor lighting, or if you do not provide precomputed light flux:
-
-- `Windows`
-- `GlassTransmission`
-- Optional: `OutdoorLightDirect`, `OutdoorLightDiffuse`
-- Optional: `ArtificialLight` (precomputed) **or** `ArtificialLightList` + `ArtificialLightSpectra` + `ArtificialLightSchedule`
-- Optional: `IndoorLight` (precomputed)
-
-### Where to find example input templates
-
-The package includes example input files under:
-
-```r
-system.file("extdata", "Input", package = "SIACS")
-```
-
-Use these as the authoritative templates for column names, units, and required fields.
-
-## Outputs
-
-### Primary results table
-
-For each simulation, SIACS produces a main time series output table (available in memory as `Simulation{i}$alldata` and typically written to CSV if configured).
-
-The table includes:
-
-- `time` (minutes)
-- Indoor concentrations (ppm for gases; µg/m³ for PM)
-- Outdoor concentrations (suffix `.O`)
-- Emission source strengths (suffix `.S`)
-- Physical variables (e.g., temperatures, air exchange rate, light flux)
-- Aggregated diagnostic groups (ALK, ARO, OLE, NOy, RO2, HOx and outdoor counterparts)
-
-### Optional analyses
-
-These are controlled by the `OutputList` entries (use `"None"` to disable):
-
-- Time derivatives (dy/dt)
-- Mass balance components (XLSX)
-- First-order sensitivities
+SIACS (Simulation of Indoor Air Chemistry and Surfaces) is a comprehensive ODE-based box model for simulating indoor air quality. This guide will help you navigate the user interface and understand the available features.
+
+## Getting Started
+
+### Launching the Application
+
+1. **Run the application**:
+   ```r
+   runApp('main_app.R')
+   ```
+   The app will automatically open in your default web browser
+
+2. **Choose your simulation mode**:
+   - **Standard Mode**: Recommended for new or ordinary users - simplified step-by-step guided setup
+   - **Advanced Mode**: For experienced users who are familiar with SIACS and know what input files are fed to the model
+
+## Main Interface Navigation
+
+The application has a navigation bar with the following tabs:
+
+### 1. List of Runs
+- View and manage all your simulation configurations
+- See simulation details: Run Name, Location, Duration, Chemical Model
+- Remove individual simulations using the "Remove" buttons
+- Save the entire queue to R environment
+
+### 2. (+) Simulation
+- Create new simulation configurations
+- Choose between Standard (simplified) and Advanced modes
+- Set basic parameters: Run Name, Location, Duration, Chemical Model
+
+### 3. Archive
+- Store and retrieve previous simulation configurations
+
+### 4. Help
+- Access this user guide and validation requirements
+
+### 5. Credits
+- View application credits and version information
+
+## Simulation Modes
+
+### Standard Mode (Recommended for New or Ordinary Users)
+
+The Wizard provides a 12-screen guided configuration process:
+
+#### Screen 1: Simulation Basics
+- Run name and location
+- Duration and chemical model selection
+- Start date and time settings
+
+#### Screen 2: Shelter Configuration
+- Select shelter class (1-5):
+  - 1: Exposed (no obstructions)
+  - 2: Normal (isolated rural house)
+  - 3: Normal (buildings across street)
+  - 4: Normal (urban, obstacles > one building height away)
+  - 5: Well-shielded (adjacent structures < one building height away)
+- Number of stories (1-3)
+
+#### Screen 3: Room Geometry
+- Floor surface area (m²)
+- Room height (m)
+- Aspect ratio and orientation
+- Number and configuration of windows
+
+#### Screen 4: Ventilation System
+- Choose ventilation type:
+  - Infiltration only
+  - Balanced mechanical ventilation
+  - Unbalanced mechanical ventilation
+  - Natural ventilation
+- Set ventilation parameters
+
+#### Screen 5: Lighting Configuration
+- Indoor lighting options:
+  - Kowal LED
+  - Kowal Incandescent
+  - Kowal CFL
+- Artificial lighting schedule
+- Window properties and geometry
+
+#### Screen 6: Occupant Activities
+- Define occupant schedules
+- Emission sources and activities
+- Activity timing and duration
+
+#### Screen 7: Environmental Conditions
+- Outdoor temperature and humidity
+- Outdoor concentrations
+- Physical environment parameters
+
+#### Screen 8: Initial Conditions
+- Chemical species initial concentrations
+- Deposition velocities
+- Surface properties
+
+#### Screen 9: Time Settings
+- Simulation time step
+- Total duration
+- Output frequency
+
+#### Screen 10: Advanced Options
+- Optional analyses and sensitivity
+- Mass balance components
 - Uncertainty propagation
 
-Important coupling:
+#### Screen 11: Summary and Validation
+- Review all configuration parameters
+- Validation checks for required inputs
+- Error and warning notifications
 
-- Mass balance, sensitivity, and uncertainty workflows depend on dy/dt output being enabled.
+#### Screen 12: Output Configuration
+- Choose output variables
+- Set file naming conventions
+- Select analysis options
 
-## Typical workflows
+### Advanced Mode
 
-### 1) Run the bundled example in the GUI
+For experienced users who want to upload their own input files:
 
-- Launch `runSIACSApp()`
-- Keep defaults (bundled example)
-- Run simulation
-- Review CSV/PNG outputs
-- Modify one set of inputs (e.g., ventilation schedule) and compare
+#### Input File Categories
 
-### 2) Run a single scenario in batch mode using bundled inputs
+**Environment Setup Files:**
+1. **Initial Values** - Chemical species initial concentrations
+2. **Deposition Velocity** - Surface deposition parameters
+3. **Physical Environment** - Temperature, humidity, pressure data
+4. **Emission Profiles** - Time-varying emission source definitions
 
-The introductory vignette provides a worked example. In general, you:
+**Source & Activity Setup:**
+5. **Outdoor Concentrations** - Background outdoor chemical concentrations
+6. **Activities** - Occupant activity schedules and emission rates
 
-1. Load input files from `system.file("extdata", "Input", package = "SIACS")`
-2. Assemble `input_data_list`
-3. Create `OutputList`
-4. Call `SIACS.batch()`
+**Light & Exposure:**
+7. **Indoor Light** - Indoor lighting spectra and intensity
+8. **Outdoor Light Direct** - Direct solar radiation components
+9. **Outdoor Light Diffuse** - Diffuse solar radiation components
+10. **Artificial Light** - Artificial lighting specifications
+11. **Artificial Light List** - Lighting fixture inventory
+12. **Artificial Light Spectra** - Light spectral data
+13. **Artificial Light Schedule** - Lighting usage schedules
 
-## Mechanisms
+**Simulation Timing:**
+14. **Time** - Simulation time parameters (start, duration, step)
+15. **Windows** - Window geometry and optical properties
+16. **Glass Transmission** - Window material transmission spectra
+17. **Box Data** - Room geometry and physical parameters
 
-- `SAPRC99`: default mechanism
-- `SAPRC07T`: updated SAPRC mechanism
+#### File Management Features
 
-Both include photolysis reactions whose rates are driven by indoor photolysis constants (J-values).
+- **Preload All Default Input Files**: Load all 17 default files at once
+- **Validate All Input Files**: Batch validation of all loaded files
+- **Show File Structure**: Diagnostic view of all loaded files
+- **Individual File Management**: Upload, import, or create files individually
+- **Real-time Validation**: Status indicators for each file
+- **Editable Preview Tables**: Modify data directly in the interface
+
+## Validation System
+
+The application includes comprehensive input validation:
+
+### Validation Indicators
+- **✓ Valid**: Green checkmark - all validation checks passed
+- **⚠ Valid with warnings**: Orange warning - valid but with advisory messages
+- **✗ Errors found**: Coral indicator - validation errors that must be fixed
+
+### Common Validation Requirements
+
+**Time Data:**
+- Required columns: StartTimeYear, StartTimeMonth, StartTimeDay, StartTime, StartTimeStandard, RelativeStartTime, TimeStep, Duration
+- Time column must have strictly increasing values
+- Valid temperature and humidity ranges
+
+**Box Data:**
+- Required columns: FloorSurfaceArea, RoomHeight
+- Physical dimensions must be non-negative
+
+**Physical Environment:**
+- Required columns: Time, Ti, To, RH, BP
+- Temperature and humidity must be within realistic ranges
+
+**Outdoor Concentrations:**
+- Required columns: Time column, species concentration columns
+- No negative concentrations allowed
+
+**Emission Profiles:**
+- Required columns: ProfileName column
+- No duplicate profile names
+- No negative emission rates
+
+## Working with Simulations
+
+### Creating a New Simulation
+
+1. Click **"(+) Simulation"** tab
+2. Fill in basic simulation details:
+   - Run Name: Descriptive name for your simulation
+   - Location: Geographic location identifier
+   - Duration: Simulation duration in hours
+   - Chemical Model: SAPRC99 or SAPRC07T
+3. Click **"Continue"** to proceed to configuration
+
+### Managing Simulation Queue
+
+1. Go to **"List of Runs"** tab
+2. View all configured simulations
+3. Use **"Remove"** buttons to delete individual simulations
+4. Click **"Save"** to store the queue in R environment
+
+### Running Simulations
+
+1. Ensure you have simulations in the queue
+2. Click **"Run Queue"** to execute all simulations
+3. Monitor console output for progress
+4. Results are saved to the Output directory
+
+## File Structure and Data Management
+
+### Input Directory Structure
+```
+Input/
+├── InitialValues.csv
+├── DepositionVelocity.csv
+├── PhysicalEnvironment.csv
+├── OutdoorConcentrations.csv
+├── EmissionProfiles.csv
+├── Activities.csv
+├── IndoorLight.xlsx
+├── OutdoorLightDirect.csv
+├── OutdoorLightDiffuse.csv
+├── ArtificialLight.csv
+├── ArtificialLightList.csv
+├── ArtificialLightSpectra.csv
+├── ArtificialLightSchedule.csv
+├── Time.csv
+├── Windows.csv
+├── GlassTransmission.csv
+└── BoxData.csv
+```
+
+### Output Directory
+- Simulation results are automatically saved to the `Output/` directory
+- File naming follows the pattern: `[RunName]_[timestamp]_[variable].csv`
+
+## Tips and Best Practices
+
+### For New Users
+1. **Start with Wizard Mode** for guided configuration
+2. **Use default files** to understand expected data format
+3. **Validate inputs** before running simulations
+4. **Check validation summary** for detailed error messages
+
+### For Advanced Users
+1. **Prepare CSV/XLSX files** according to the required column specifications
+2. **Use validation** to catch errors early
+3. **Leverage preview tables** to verify data before simulation
+4. **Save configurations** for reuse and documentation
+
+### General Tips
+1. **Save frequently** to avoid losing work
+2. **Use descriptive run names** for easy identification
+3. **Check console output** for simulation progress and errors
+4. **Review validation warnings** - they may indicate potential issues
 
 ## Troubleshooting
 
-- **Missing or misnamed columns**: Use the bundled example inputs as templates; SIACS expects exact column names in many tables.
-- **Duration mismatch errors**: Ensure every time series input spans the full simulation duration (time in minutes for most inputs; the ODE solver time vector is in seconds).
-- **Indoor light not provided**: If `IndoorLight` is `NULL`, you must provide window/glass inputs and (optionally) artificial light definitions so SIACS can compute indoor photolysis rates.
-- **Parallel file collisions**: In parallel mode, ensure `OutputList` paths are unique per instance; SIACS appends the instance number to many outputs.
+### Common Issues
 
-## Verification, validation, and checking outputs
+**Application won't start:**
+- Ensure all required packages are installed
+- Check that main_app.R is in the working directory
+- Verify R version compatibility
 
-### What to check before trusting results
+**Simulation crashes silently with empty Output folder (no log file):**
 
-- **Code-level confidence**: when you modify code or add new routines, compare against simple independent calculations or small test cases.
-- **Model-level confidence**: compare key outputs against published results, measurements, or alternative models when available for your scenario class.
-- **Usability/robustness**: test what happens when inputs are missing or malformed and ensure failures are informative rather than silent.
+This usually means a required R package is missing from your installation. SIACS uses two sets of packages: a GUI set that loads when the app starts (these auto-install on first launch) and an *engine* set that the background simulation process needs at run time.
 
-### Practical output checks you can do
+If you saw a successful app launch but a silent crash when clicking **Run Queue**, check `siacs_child_steps.log` in the project folder. A line like:
 
-For a given scenario (especially when modifying inputs), check:
-
-- **Reproducibility**: with identical inputs and deterministic settings, repeated runs should produce the same output. As a practical check, you can rerun the same scenario and confirm key outputs match (or differ only within a small numerical tolerance).
-- **Sanity checks on mass-balance drivers**:
-  - ventilation schedules (units and magnitudes)
-  - deposition velocities and filter efficiencies
-  - outdoor concentrations and emission schedules
-- **Time coverage**: confirm all required time-series inputs cover the full simulated period.
-
-### Sensitivity and uncertainty
-
-Uncertainty arises from:
-
-- **Model-form uncertainty** (approximations of the indoor environment and simplified processes)
-- **Measurement/input uncertainty**
-
-SIACS supports optional analyses (sensitivity and uncertainty propagation). For broader uncertainty characterization, Monte Carlo approaches can be used by sampling uncertain parameters from assumed distributions and rerunning the model repeatedly.
-
-## Citation
-
-```r
-citation("SIACS")
+```
+[engine] FAILED library deSolve: there is no package called 'deSolve'
+[engine] FATAL: missing package deSolve
 ```
 
-## References and attribution
+…tells you which package is missing. The most common culprit is **`deSolve`** — the ODE solver — which is a hard requirement.
 
-This guide was written based on the SIACS package source code and package documentation, and it also draws on concepts and terminology from the SIACS Quality Assurance Project Plan (QAPP) included in this repository.
+To install all engine packages manually, run this once in your R console:
 
-- Development of EPA’s Simplified Indoor Air Chemistry Simulator (SIACS) Model — Version 1.0 (QAPP). Source file(s) in this repository:
-  - `Final_SIACS_QAPP_v1_signed_011022.pdf`
-  - text extraction used for drafting: `SIACS_qapp.txt`
-- Carter, W. P. L. (2000). Documentation of the SAPRC-99 chemical mechanism for VOC reactivity assessment.
-- Carter, W. P. L. (2010). Development of the SAPRC-07 chemical mechanism.
+```r
+install.packages(c("deSolve", "reshape", "ggplot2", "openxlsx",
+                   "doParallel", "foreach", "rstudioapi"))
+```
 
-## Notes on the PDF in this repository
+The current SIACS version installs these automatically at app launch, but if you have a restricted package library, no internet access on first run, or a corporate firewall, the auto-install can fail silently. Installing manually first avoids the issue.
 
-This repository also contains a PDF (`Final_SIACS_QAPP_v1_signed_011022.pdf`). In this environment I can’t directly parse the binary PDF; I can, however, incorporate content from a text-extracted version such as `SIACS_qapp.txt`.
+**Diagnostic log files:**
+
+When troubleshooting any silent crash, three log files in the project folder tell you exactly where things went wrong:
+
+- `siacs_startup.log` — written when the app launches; contains R version, library paths, OS, OneDrive detection, and per-package load status.
+- `siacs_child_started.log` — written the instant the background simulation process launches. If this exists but `siacs_child_steps.log` does not, the simulation crashed before it could load its diagnostic helper.
+- `siacs_child_steps.log` — written step-by-step as the simulation engine starts up. The last line tells you which step failed (loading a package, compiling source files, starting the parallel cluster, etc.).
+
+**OneDrive sync conflicts:**
+
+Running SIACS from inside a OneDrive-synced folder can cause silent crashes, because the sync client may lock files mid-run. If you see a yellow warning banner at the top of the Simulation Queue tab, copy SIACS to a non-synced local folder (e.g. `C:\SIACS\`) and run from there.
+
+**Validation errors:**
+- Check file formats (CSV/XLSX)
+- Verify required columns are present
+- Ensure numerical values are in valid ranges
+
+**Simulation failures:**
+- Review input data for negative values where inappropriate
+- Check time series for continuity
+- Verify chemical mechanism compatibility
+
+### Getting Help
+
+1. **Check the Help tab** in the application
+2. **Review validation messages** for specific guidance
+3. **Consult this user guide** for detailed instructions
+4. **Check existing documentation** in the SIACS_cran directory
+
+## Keyboard Shortcuts and Navigation
+
+### Wizard Navigation
+- **Next**: Proceed to next wizard screen
+- **Previous**: Return to previous screen
+- **Save Progress**: Store current wizard state
+- **Finish**: Complete wizard and create simulation
+
+### General Navigation
+- **Tab navigation**: Click tab names or use Ctrl+Tab
+- **Modal windows**: Click outside or use Escape key
+- **Validation**: Click validation buttons to check inputs
+
+## Technical Notes
+
+### System Requirements
+- R 4.0+ recommended (tested with R 4.3.1 and R 4.5.0)
+- Memory: 4GB+ RAM recommended for large simulations
+
+### Required R Packages
+
+SIACS uses two sets of packages. The app attempts to install missing packages automatically on first launch, but if you have a restricted package library or no internet access, install them manually first.
+
+**GUI packages** (loaded when the Shiny app starts):
+
+```r
+install.packages(c("shiny", "jsonlite", "tidygeocoder", "dplyr", "DT",
+                   "shinyFiles", "rhandsontable", "shinyjs", "shinyBS",
+                   "readxl", "zoo", "processx", "plotly", "reshape2"))
+```
+
+**Engine packages** (loaded by the background simulation process; missing any of these will cause Run Queue to fail):
+
+```r
+install.packages(c("deSolve", "reshape", "ggplot2", "openxlsx",
+                   "doParallel", "foreach", "rstudioapi"))
+```
+
+`deSolve` is the ODE solver and is the most common missing package on fresh R installations. Note that `reshape` (the original) and `reshape2` are different packages — both are required.
+
+### Performance Considerations
+- Large time series may require significant processing time
+- Complex chemical mechanisms increase computational requirements
+- Multiple simultaneous simulations may impact performance
+
+---
+
+## Version Information
+
+This guide corresponds to SIACS version with the following modules:
+- main_app.R (Main application interface)
+- wizard_module.R (12-screen configuration wizard)
+- advanced_module.R (Advanced file upload interface)
+- shared.r (Validation and utility functions)
+
+For the most up-to-date information, check the Help tab within the application or consult the README.md file in the SIACS_cran directory.

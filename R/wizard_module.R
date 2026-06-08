@@ -416,7 +416,8 @@ wizard_module_ui <- function() {
                 div(class="event-panel",
                   h5("Add step-change event"),
                   selectInput("wiz_light_sel","Light",choices=c()),
-                  numericInput("wiz_light_event_time","At time (min)",value=0,min=0),
+                  numericInput("wiz_light_event_time","Start time (min)",value=0,min=0),
+                  numericInput("wiz_light_event_end","End time (min, optional)",value=NA,min=0),
                   numericInput("wiz_light_event_power","Power level (W)",value=60,min=0),
                   fluidRow(
                     column(6,
@@ -428,7 +429,9 @@ wizard_module_ui <- function() {
                 ),
                 p(style="color:#666;font-size:11px;margin-top:6px;",
                   "'Time On' sets power to the specified level; 'Time Off' sets it to 0. ",
-                  "Both insert a transition row at (time \u2212 transition time) using the current value."),
+                  "If you set an End time, the light returns to its previous level then, ",
+                  "so the event only lasts for that window. Leave End time blank for an ",
+                  "open-ended change. Both insert a transition row at (time \u2212 transition time)."),
                 actionButton("wiz_light_sched_reset","Reset to Default",
                   style="background:#95a5a6;color:#fff;width:100%;margin-top:6px;")
               ),
@@ -511,17 +514,24 @@ wizard_module_ui <- function() {
                 div(class="event-panel",
                   h5("Add step-change event"),
                   p(style="color:#666;font-size:11px;",
-                    "For Open Window, Ventilation, and Filter variables only. ",
-                    "Inserts rows at (t − transition time) and t."),
+                    "Set a Start time and the new value; optionally set an End time ",
+                    "to return the variable to its previous value then (bounded event). ",
+                    "Leave End time blank for an open-ended change."),
                   selectInput("wiz_phys_step_var","Variable",
                     choices=c(
-                      "Open Window Area (m²)"     ="OpenWindowArea",
-                      "Balanced Ventilation (m³/s)"   ="QBal",
-                      "Unbalanced Ventilation (m³/s)" ="QUnbal",
-                      "Filter Flow Rate (m³/s)"        ="QFilter")),
+                      "Indoor Temp Ti (Kelvin)"        ="Ti",
+                      "Outdoor Temp To (Kelvin)"       ="To",
+                      "Open Window Area (m²)"          ="OpenWindowArea",
+                      "Balanced Ventilation (m³/s)"    ="QBal",
+                      "Unbalanced Ventilation (m³/s)"  ="QUnbal",
+                      "Filter Flow Rate (m³/s)"        ="QFilter",
+                      "Relative Humidity ([0,1])"      ="RH",
+                      "Barometric Pressure (Pascal)"   ="BP",
+                      "Wind Speed (m/s)"               ="Wind")),
                   fluidRow(
-                    column(6,numericInput("wiz_phys_step_time", "At time (min)", value=60, min=0)),
-                    column(6,numericInput("wiz_phys_step_value","New value (m² or m³/s)",      value=0))),
+                    column(6,numericInput("wiz_phys_step_time", "Start time (min)", value=60, min=0)),
+                    column(6,numericInput("wiz_phys_step_end", "End time (min, optional)", value=NA, min=0))),
+                  numericInput("wiz_phys_step_value","New value", value=0),
                   actionButton("wiz_add_phys_step","Add Event",
                     style="background:#9B59B6;color:#fff;width:100%;")
                 )
@@ -586,10 +596,13 @@ wizard_module_ui <- function() {
                 div(class="event-panel",
                   h5("Add step-change event"),
                   p(style="color:#666;font-size:11px;",
-                    "Inserts rows at (t − transition time) and t."),
+                    "Set a Start time and value; optionally set an End time to return ",
+                    "the activity to its previous level then (bounded event). Leave End ",
+                    "time blank for an open-ended change."),
                   fluidRow(
-                    column(6,numericInput("wiz_activity_event_time", "At time (min)",value=0,min=0)),
-                    column(6,numericInput("wiz_activity_event_value",HTML("New value (× emission profile)"),     value=0,min=0))),
+                    column(6,numericInput("wiz_activity_event_time", "Start time (min)",value=0,min=0)),
+                    column(6,numericInput("wiz_activity_event_end", "End time (min, optional)",value=NA,min=0))),
+                  numericInput("wiz_activity_event_value",HTML("New value (× emission profile)"), value=0,min=0),
                   actionButton("wiz_add_activity_event","Add Event",
                     style="background:#E67E22;color:#fff;width:100%;"),
                   actionButton("wiz_reset_activity","Reset to Default",
@@ -749,8 +762,10 @@ wizard_module_server <- function(input, output, session) {
     max_screen         = 12,
     light_schedule     = NULL,   # data.frame: Time, Light1, Light2, ...
     phys_schedule      = NULL,   # data.frame: Time, Ti, To, OpenWindowArea, ...
+    phys_uncertainty   = NULL,   # one-row data.frame: editable uncertainty values
     activity_schedules = list(), # named list of Time/Value data.frames
     outdoor_manual     = NULL,   # data.frame: Time + all species
+    outdoor_uncertainty = NULL,  # one-row data.frame: editable uncertainty values
     windows_data       = NULL,   # data.frame: one row per window — file-sourced truth
     initial_values_df  = NULL,   # data.frame: uploaded InitialIndoorConcentrations
     initial_values_name = NULL,  # character(1): original filename for snapshot
@@ -770,8 +785,10 @@ wizard_module_server <- function(input, output, session) {
       wizard_state$current_screen      <- 1
       wizard_state$light_schedule      <- NULL
       wizard_state$phys_schedule       <- NULL
+      wizard_state$phys_uncertainty    <- NULL
       wizard_state$activity_schedules  <- list()
       wizard_state$outdoor_manual      <- NULL
+      wizard_state$outdoor_uncertainty <- NULL
       wizard_state$windows_data        <- NULL
       wizard_state$initial_values_df   <- NULL
       wizard_state$initial_values_name <- NULL
@@ -1205,27 +1222,33 @@ wizard_module_server <- function(input, output, session) {
     wizard_state$light_schedule <- fill_schedule_gaps(hot_to_r(input$wiz_light_schedule_table))
   }, ignoreInit=TRUE)
 
-  # Time On
+  # Time On — turns the light ON at the start time; if an End time is given,
+  # the light returns to its previous level then (bounded window).
   observeEvent(input$wiz_light_on, {
     req(input$wiz_light_sel, input$wiz_light_event_time, input$wiz_light_event_power)
     sched    <- get_light_schedule()
     if (is.null(sched)) return()
     col      <- input$wiz_light_sel
     t        <- input$wiz_light_event_time
+    t_end    <- input$wiz_light_event_end   # may be NA
     new_val  <- input$wiz_light_event_power
     trans    <- input$wiz_activity_transition %||% 0.1
-    wizard_state$light_schedule <- fill_schedule_gaps(insert_step_change_wide(sched, col, t, new_val, trans))
+    wizard_state$light_schedule <- fill_schedule_gaps(
+      insert_event_window_wide(sched, col, t, new_val, t_end, trans))
   })
 
-  # Time Off
+  # Time Off — sets the light to 0 at the start time; if an End time is given,
+  # the light returns to its previous level then (bounded off-window).
   observeEvent(input$wiz_light_off, {
     req(input$wiz_light_sel, input$wiz_light_event_time)
     sched    <- get_light_schedule()
     if (is.null(sched)) return()
     col      <- input$wiz_light_sel
     t        <- input$wiz_light_event_time
+    t_end    <- input$wiz_light_event_end   # may be NA
     trans    <- input$wiz_activity_transition %||% 0.1
-    wizard_state$light_schedule <- fill_schedule_gaps(insert_step_change_wide(sched, col, t, 0, trans))
+    wizard_state$light_schedule <- fill_schedule_gaps(
+      insert_event_window_wide(sched, col, t, 0, t_end, trans))
   })
 
   # Reset to default schedule
@@ -1269,24 +1292,39 @@ wizard_module_server <- function(input, output, session) {
 
   output$wiz_phys_schedule_table <- renderRHandsontable({
     req(wizard_state$phys_schedule)
-    rhandsontable(wizard_state$phys_schedule, rowHeaders=NULL, stretchH="all") %>%
+    # Ensure an uncertainty row exists, then display it on top so the user can
+    # see and edit the per-variable uncertainty values directly.
+    if (is.null(wizard_state$phys_uncertainty)) {
+      wizard_state$phys_uncertainty <- make_default_uncertainty_row(
+        wizard_state$phys_schedule,
+        defaults = .siacs_phys_uncertainty_defaults, fallback = 0)
+    }
+    disp <- combine_with_uncertainty(wizard_state$phys_schedule,
+                                     wizard_state$phys_uncertainty)
+    # Show units in the (read-only) column headers, e.g. "Ti (Kelvin)".
+    disp <- apply_header_units(disp, units = .siacs_phys_units)
+    rhandsontable(disp, rowHeaders=NULL, stretchH="all") %>%
       hot_table(highlightCol=TRUE, highlightRow=TRUE)
   })
 
   observeEvent(input$wiz_phys_schedule_table, {
     req(input$wiz_phys_schedule_table)
-    wizard_state$phys_schedule <- fill_schedule_gaps(hot_to_r(input$wiz_phys_schedule_table))
+    edited <- strip_header_units(hot_to_r(input$wiz_phys_schedule_table))
+    parts  <- split_uncertainty(edited)
+    if (!is.null(parts$uncertainty)) wizard_state$phys_uncertainty <- parts$uncertainty
+    wizard_state$phys_schedule <- fill_schedule_gaps(parts$schedule)
   }, ignoreInit=TRUE)
 
   observeEvent(input$wiz_add_phys_step, {
     req(wizard_state$phys_schedule, input$wiz_phys_step_var,
         input$wiz_phys_step_time, input$wiz_phys_step_value)
     trans <- input$wiz_activity_transition %||% 0.1
-    wizard_state$phys_schedule <- fill_schedule_gaps(insert_step_change_wide(
+    wizard_state$phys_schedule <- fill_schedule_gaps(insert_event_window_wide(
       wizard_state$phys_schedule,
       input$wiz_phys_step_var,
       input$wiz_phys_step_time,
       input$wiz_phys_step_value,
+      input$wiz_phys_step_end,   # may be NA → open-ended
       trans
     ))
   })
@@ -1422,8 +1460,10 @@ wizard_module_server <- function(input, output, session) {
       dur   <- (input$wiz_duration %||% 27) * 60
       sched <- data.frame(Time=c(0,dur), Value=c(0,0), stringsAsFactors=FALSE)
     }
-    wizard_state$activity_schedules[[act]] <- fill_schedule_gaps(insert_step_change_two_col(
-      sched, input$wiz_activity_event_time, input$wiz_activity_event_value, trans))
+    wizard_state$activity_schedules[[act]] <- fill_schedule_gaps(insert_event_window_two_col(
+      sched, input$wiz_activity_event_time, input$wiz_activity_event_value,
+      input$wiz_activity_event_end,   # may be NA → open-ended
+      trans))
   })
 
   observeEvent(input$wiz_reset_activity, {
@@ -1491,13 +1531,26 @@ wizard_module_server <- function(input, output, session) {
 
   output$wiz_outdoor_manual_table <- renderRHandsontable({
     req(wizard_state$outdoor_manual)
-    rhandsontable(wizard_state$outdoor_manual, rowHeaders=NULL, stretchH="none") %>%
+    # Show an editable Uncertainty row on top (relative uncertainty per species).
+    if (is.null(wizard_state$outdoor_uncertainty)) {
+      wizard_state$outdoor_uncertainty <- make_default_uncertainty_row(
+        wizard_state$outdoor_manual, defaults = list(), fallback = 0.05)
+    }
+    disp <- combine_with_uncertainty(wizard_state$outdoor_manual,
+                                     wizard_state$outdoor_uncertainty)
+    # Every species column is in ppm; Time stays unitless. Units shown in the
+    # read-only column headers, e.g. "O3 (ppm)".
+    disp <- apply_header_units(disp, units = c(Time = "min"), default_unit = "ppm")
+    rhandsontable(disp, rowHeaders=NULL, stretchH="none") %>%
       hot_table(highlightCol=TRUE, highlightRow=TRUE)
   })
 
   observeEvent(input$wiz_outdoor_manual_table, {
     req(input$wiz_outdoor_manual_table)
-    wizard_state$outdoor_manual <- fill_schedule_gaps(hot_to_r(input$wiz_outdoor_manual_table))
+    edited <- strip_header_units(hot_to_r(input$wiz_outdoor_manual_table))
+    parts  <- split_uncertainty(edited)
+    if (!is.null(parts$uncertainty)) wizard_state$outdoor_uncertainty <- parts$uncertainty
+    wizard_state$outdoor_manual <- fill_schedule_gaps(parts$schedule)
   }, ignoreInit=TRUE)
 
   # Preview default outdoor file

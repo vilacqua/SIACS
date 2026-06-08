@@ -7,9 +7,24 @@
 # lives next to the project root and is overwritten on each launch.
 source('siacs_diagnostics.R')
 
-SIACS_STARTUP_LOG <- file.path(getwd(), "siacs_startup.log")
+# ── Install root (read-only) vs. workspace (writable) ────────────────────────
+# SIACS_INSTALL_DIR is where the code, default Input/ files, and tuv5.3.1.exe/
+# live. We must NOT write into it (admin-approval prompts under Program Files
+# or Controlled Folder Access). SIACS_WORKSPACE_DIR is a per-user writable
+# location where ALL runtime artifacts go: logs, Input_*/Output_* folders,
+# per-instance run logs. The Shiny session's working directory is switched to
+# the workspace so every relative-path write lands in a safe place, while
+# default inputs and TUV are resolved via absolute paths under the install dir.
+SIACS_INSTALL_DIR   <- normalizePath(getwd(), winslash = "/", mustWork = FALSE)
+SIACS_WORKSPACE_DIR <- siacs_workspace_dir()
+assign("SIACS_INSTALL_DIR",   SIACS_INSTALL_DIR,   envir = .GlobalEnv)
+assign("SIACS_WORKSPACE_DIR", SIACS_WORKSPACE_DIR, envir = .GlobalEnv)
+
+SIACS_STARTUP_LOG <- file.path(SIACS_WORKSPACE_DIR, "siacs_startup.log")
 siacs_log_init(SIACS_STARTUP_LOG, "SIACS GUI startup log")
 siacs_log_line(SIACS_STARTUP_LOG, "[startup] main_app.R sourcing started")
+siacs_log_line(SIACS_STARTUP_LOG, paste0("[startup] install dir:   ", SIACS_INSTALL_DIR))
+siacs_log_line(SIACS_STARTUP_LOG, paste0("[startup] workspace dir: ", SIACS_WORKSPACE_DIR))
 
 # ── OneDrive detection ───────────────────────────────────────────────────────
 # Running SIACS from a OneDrive-synced folder is a known source of silent
@@ -27,11 +42,13 @@ if (isTRUE(.siacs_od$in_onedrive)) {
 }
 
 # ── Stale .Rc bytecode cleanup ───────────────────────────────────────────────
-# R bytecode (.Rc) files are NOT portable across R versions. The project ships
-# with .Rc files compiled on the maintainer's machine; loading those on a
-# different R version can crash silently. Remove them at startup so that
-# SIACS_Compile_Source.R rebuilds them fresh in the current R version.
-siacs_clean_rc_files(getwd(), log_file = SIACS_STARTUP_LOG)
+# R bytecode (.Rc) files are NOT portable across R versions. Older SIACS
+# builds shipped .Rc files in the install dir; remove any that are present so
+# nothing stale is ever loaded. New builds compile bytecode into a per-user
+# cache (see SIACS_Compile_Source.R), so the install dir should stay clean.
+# This file.remove is best-effort: if the install dir is read-only it simply
+# does nothing (no admin prompt, since file.remove fails silently here).
+siacs_clean_rc_files(SIACS_INSTALL_DIR, log_file = SIACS_STARTUP_LOG)
 
 # ===== Libraries =====
 # Load each package via siacs_safe_library() so any missing or broken
@@ -95,6 +112,29 @@ source('wizard_module.R')
 source('wizard_defaults.R')
 source('wizard_helpers.R')
 siacs_log_line(SIACS_STARTUP_LOG, "[startup] modules sourced OK")
+
+# ── Make default input paths absolute, then switch CWD to the workspace ──────
+# shared.R defines file_paths_advanced as relative "./Input/..." paths. Once we
+# setwd() to the writable workspace, those relatives would no longer resolve,
+# so we rebase them onto the (read-only) install dir as absolute paths first.
+# After this point every relative-path write in the app lands in the workspace
+# instead of the install dir — eliminating admin-approval prompts.
+if (exists("file_paths_advanced")) {
+  file_paths_advanced <- vapply(file_paths_advanced, function(p) {
+    if (is.na(p) || !nzchar(p) || identical(p, "none")) return(p)
+    rel <- sub("^\\./", "", p)
+    file.path(SIACS_INSTALL_DIR, rel)
+  }, character(1), USE.NAMES = FALSE)
+  assign("file_paths_advanced", file_paths_advanced, envir = .GlobalEnv)
+  siacs_log_line(SIACS_STARTUP_LOG,
+    "[startup] default input paths rebased onto install dir")
+}
+
+# Switch working directory to the writable workspace for the rest of the
+# session. The install dir remains accessible via SIACS_INSTALL_DIR.
+setwd(SIACS_WORKSPACE_DIR)
+siacs_log_line(SIACS_STARTUP_LOG,
+  paste0("[startup] working directory switched to workspace: ", getwd()))
 
 # ===== Main UI =====
 ui <- navbarPage(
@@ -1022,10 +1062,15 @@ server <- function(input, output, session) {
   #
   # rdata_file: path to the saved .RData with input_data_list, instances, etc.
   build_siacs_child_script <- function(rdata_file) {
-    project_dir       <- getwd()
+    # The CODE, default inputs and TUV live in the (read-only) install dir; the
+    # engine sources its supporting scripts with relative paths and locates TUV
+    # via its working directory, so the child must run with cwd = install dir.
+    # All WRITES go to absolute paths under the workspace (output dirs are made
+    # absolute at creation time), so nothing lands in the install dir.
+    project_dir       <- SIACS_INSTALL_DIR
     diag_helper       <- file.path(project_dir, "siacs_diagnostics.R")
-    child_started_log <- file.path(project_dir, "siacs_child_started.log")
-    child_steps_log   <- file.path(project_dir, "siacs_child_steps.log")
+    child_started_log <- file.path(SIACS_WORKSPACE_DIR, "siacs_child_started.log")
+    child_steps_log   <- file.path(SIACS_WORKSPACE_DIR, "siacs_child_steps.log")
     siacs_engine      <- file.path(project_dir, "SIACS_0924_Merged_2.R")
 
     script_file <- tempfile(fileext = ".R")
@@ -1043,10 +1088,15 @@ server <- function(input, output, session) {
       paste0("siacs_log_init(CHILD_LOG, 'SIACS child Rscript')"),
       "siacs_log_line(CHILD_LOG, '[child] sentinel 0: helper sourced')",
 
-      # ── Sentinel 1: setwd to project dir ────────────────────────────────
-      paste0("siacs_log_line(CHILD_LOG, paste0('[child] setwd to: ', ",
+      # ── Sentinel 1: setwd to the install dir (code + TUV + default inputs) ──
+      paste0("siacs_log_line(CHILD_LOG, paste0('[child] setwd to install dir: ', ",
              deparse(project_dir), "))"),
       paste0("setwd(", deparse(project_dir), ")"),
+      # Make the install dir explicit to the engine so tuv_sandbox_dir() locates
+      # tuv5.3.1.exe/ even though writes go to the workspace.
+      paste0("assign('SIACS_ROOT', ", deparse(project_dir), ", envir = .GlobalEnv)"),
+      paste0("assign('SIACS_INSTALL_DIR', ", deparse(project_dir), ", envir = .GlobalEnv)"),
+      paste0("assign('SIACS_WORKSPACE_DIR', ", deparse(SIACS_WORKSPACE_DIR), ", envir = .GlobalEnv)"),
 
       # ── Sentinel 2: load .RData with run inputs ─────────────────────────
       paste0("siacs_log_line(CHILD_LOG, paste0('[child] loading RData: ', ",
@@ -1339,7 +1389,12 @@ server <- function(input, output, session) {
       orig_idx <- orig_instances[new_pos]
       od <- instance_dirs_run[[as.character(orig_idx)]]$output %||%
             paste0("Output_", orig_idx, "_", ts_fallback)
+      # Anchor to the workspace + make absolute so the child process (cwd =
+      # install dir) writes outputs into the writable workspace, not the
+      # read-only install dir.
+      if (!grepl("^([A-Za-z]:|/|\\\\)", od)) od <- file.path(SIACS_WORKSPACE_DIR, od)
       dir.create(od, recursive = TRUE, showWarnings = FALSE)
+      od <- normalizePath(od, winslash = "/", mustWork = FALSE)
       instance_dirs_run[[as.character(orig_idx)]]$output <- od
     }
     assign("instance_dirs", instance_dirs_run, envir = .GlobalEnv)
@@ -1374,7 +1429,12 @@ server <- function(input, output, session) {
     run_env$instance_input_dirs <- lapply(seq_along(orig_instances), function(i) {
       orig_idx <- orig_instances[i]
       d <- instance_dirs_run[[as.character(orig_idx)]]$input
-      if (!is.null(d) && nzchar(d)) d else getwd()
+      if (is.null(d) || !nzchar(d)) d <- SIACS_WORKSPACE_DIR
+      # Anchor relative input dirs to the workspace + make absolute, so the
+      # child (cwd = install dir) saves auto-generated light files into the
+      # writable workspace rather than the read-only install dir.
+      if (!grepl("^([A-Za-z]:|/|\\\\)", d)) d <- file.path(SIACS_WORKSPACE_DIR, d)
+      normalizePath(d, winslash = "/", mustWork = FALSE)
     })
     # Also carry over any other needed globals
     for (v in c("mechanism", "perturbation", "chemistry", "SIACSVersion")) {
@@ -1443,7 +1503,12 @@ server <- function(input, output, session) {
       orig_idx <- orig_instances[new_pos]
       od <- instance_dirs_run[[as.character(orig_idx)]]$output %||%
             paste0("Output_", orig_idx, "_", ts_fallback)
+      # Anchor to the workspace + make absolute so the child process (cwd =
+      # install dir) writes outputs into the writable workspace, not the
+      # read-only install dir.
+      if (!grepl("^([A-Za-z]:|/|\\\\)", od)) od <- file.path(SIACS_WORKSPACE_DIR, od)
       dir.create(od, recursive = TRUE, showWarnings = FALSE)
+      od <- normalizePath(od, winslash = "/", mustWork = FALSE)
       instance_dirs_run[[as.character(orig_idx)]]$output <- od
     }
     assign("instance_dirs", instance_dirs_run, envir = .GlobalEnv)
@@ -1477,7 +1542,12 @@ server <- function(input, output, session) {
     run_env$instance_input_dirs <- lapply(seq_along(orig_instances), function(i) {
       orig_idx <- orig_instances[i]
       d <- instance_dirs_run[[as.character(orig_idx)]]$input
-      if (!is.null(d) && nzchar(d)) d else getwd()
+      if (is.null(d) || !nzchar(d)) d <- SIACS_WORKSPACE_DIR
+      # Anchor relative input dirs to the workspace + make absolute, so the
+      # child (cwd = install dir) saves auto-generated light files into the
+      # writable workspace rather than the read-only install dir.
+      if (!grepl("^([A-Za-z]:|/|\\\\)", d)) d <- file.path(SIACS_WORKSPACE_DIR, d)
+      normalizePath(d, winslash = "/", mustWork = FALSE)
     })
     # Also carry over any other needed globals
     for (v in c("mechanism", "perturbation", "chemistry", "SIACSVersion")) {
