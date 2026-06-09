@@ -457,32 +457,13 @@ advanced_module_server <- function(input, output, session, get_duration,
             }
             edited_df <- restore_units_attr(edited_df)
 
-            # Normalize pre-transition rows for schedules that use step-change
-            # semantics. Only insert a pre-row (at t - 0.1 min) in FRONT of
-            # rows the user actually edited in this firing — pre-existing
-            # value changes in the preloaded file are left untouched.
-            #   5  = Activities
-            #   17 = Artificial Light Schedule
-            if (fi %in% c(5L, 17L) && is.data.frame(edited_df) &&
-                "Time" %in% names(edited_df) &&
-                exists("insert_pretransitions_for_edits", mode = "function")) {
-              # Baseline for diff: whatever is currently stored for this file
-              stored_df <- NULL
-              for (prefix in c("data", "data_online", "data_preload", "data_create")) {
-                k <- paste0(prefix, fi)
-                if (!is.null(data_list_advanced[[k]])) {
-                  stored_df <- data_list_advanced[[k]]
-                  break
-                }
-              }
-              if (is.data.frame(stored_df)) {
-                edited_df <- tryCatch(
-                  insert_pretransitions_for_edits(edited_df, stored_df, trans = 0.1),
-                  error = function(e) { warning(e); edited_df }
-                )
-                edited_df <- restore_units_attr(edited_df)
-              }
-            }
+            # NOTE: Live-table edits are treated like a spreadsheet — the user's
+            # edit is authoritative and no rows are auto-inserted. (Previously
+            # Activities / Artificial Light Schedule edits triggered
+            # insert_pretransitions_for_edits(), which added a phantom row at
+            # t-0.1 in front of each edited row. That confused users who expected
+            # plain cell editing. Step transitions, if desired, can be added
+            # explicitly via the event panel or by editing rows directly.)
 
             # Determine which data source to update based on what was loaded.
             # Guard against write-when-unchanged: if the current stored value
@@ -1309,6 +1290,8 @@ advanced_module_server <- function(input, output, session, get_duration,
 
     files_written <- character(0)
     files_skipped <- character(0)
+    # Map engine role key -> snapshot filename, for output-file metadata.
+    written_role_files <- list()
     folder_ok <- tryCatch({
       if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
       TRUE
@@ -1380,6 +1363,10 @@ advanced_module_server <- function(input, output, session, get_duration,
             write_data_csv(df, out_path, fallback_units = adv_fallback_units(i, df))
           }
           files_written <- c(files_written, file_name)
+          # Record role -> filename for output metadata (use engine key names).
+          role_key <- gsub(" ", "", titles_advanced[i])
+          if (role_key == "DepositionVelocity") role_key <- "DepositionV"
+          written_role_files[[role_key]] <- file_name
           cat("  Written:", file_name, "\n")
         }, error = function(e) {
           files_skipped <- c(files_skipped, file_name)
@@ -1434,6 +1421,26 @@ advanced_module_server <- function(input, output, session, get_duration,
                 !is.null(live_output$OutputTable) &&
                 nzchar(trimws(live_output$OutputTable %||% ""))
     ol[[current_idx_ol]] <- if (has_live) live_output else wizard_output_defaults()
+
+    # ── Record input-file provenance for the output-file metadata block ────────
+    # Save.results() reads OutputList[[idx]]$BoxData, $Time, etc. to write the
+    # "#..." comment header listing input files. Populate them from the snapshot
+    # filenames captured during the write loop above.
+    rf <- function(key) {
+      v <- written_role_files[[key]]
+      if (!is.null(v) && nzchar(v)) v else ""
+    }
+    ol[[current_idx_ol]]$BoxData               <- rf("BoxData")
+    ol[[current_idx_ol]]$Time                  <- rf("Time")
+    ol[[current_idx_ol]]$DepositionV           <- rf("DepositionV")
+    ol[[current_idx_ol]]$PhysicalEnvironment   <- rf("PhysicalEnvironment")
+    ol[[current_idx_ol]]$OutdoorConcentrations <- rf("OutdoorConcentrations")
+    ol[[current_idx_ol]]$EmissionProfiles      <- rf("EmissionProfiles")
+    ol[[current_idx_ol]]$Activities            <- rf("Activities")
+    il_adv <- rf("IndoorLight")
+    ol[[current_idx_ol]]$IndoorLight <-
+      if (nzchar(il_adv)) il_adv else "(calculated by SIACS)"
+
     assign("OutputList", ol, envir = .GlobalEnv)
 
     # ── Derive metadata from uploaded input files ──────────────────────────────

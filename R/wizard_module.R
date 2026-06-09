@@ -186,7 +186,7 @@ wizard_module_ui <- function() {
           div(class="screen-title","Simulation Time"),
           uiOutput("wiz_val_banner_3"),
           fluidRow(
-            column(4,numericInput("wiz_duration", "Duration (hours)",     value=27, min=1,  max=168)),
+            column(4,numericInput("wiz_duration", "Duration (hours)",     value=24, min=1,  max=168)),
             column(4,numericInput("wiz_timestep", "Time Step (minutes)",  value=5,  min=0.1,max=60)),
             column(4,
               numericInput("wiz_activity_transition","Activity Transition (minutes)",

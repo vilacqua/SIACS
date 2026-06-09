@@ -1191,10 +1191,41 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
   static_defaults <- c("GlassTransmission.csv", "EmissionProfiles.csv",
                         "Vd&P-Carslaw 2012.csv",
                         "ArtificialLightSpectra.csv")
+  # Map each static default filename to its engine role key so the snapshot
+  # path can be recorded in files_created (used for output-file metadata).
+  static_role_map <- c(
+    "GlassTransmission.csv"     = "GlassTransmission",
+    "EmissionProfiles.csv"      = "EmissionProfiles",
+    "Vd&P-Carslaw 2012.csv"     = "DepositionV",
+    "ArtificialLightSpectra.csv" = "ArtificialLightSpectra"
+  )
+  # Resolve a default input file robustly. find_input_file() looks in the
+  # RELATIVE "Input" dir, but the app setwd()s to the workspace at startup
+  # (which has no Input/ folder), so that lookup fails at runtime. Prefer the
+  # rebased-absolute file_paths_advanced, then the install dir, then relative.
+  resolve_default_input <- function(fname) {
+    if (exists("file_paths_advanced")) {
+      hit <- file_paths_advanced[basename(file_paths_advanced) == fname]
+      if (length(hit) > 0 && file.exists(hit[1])) return(hit[1])
+    }
+    if (exists("SIACS_INSTALL_DIR", envir = .GlobalEnv)) {
+      p <- file.path(get("SIACS_INSTALL_DIR", envir = .GlobalEnv), "Input", fname)
+      if (file.exists(p)) return(p)
+    }
+    src <- find_input_file(tools::file_path_sans_ext(fname))
+    if (!is.null(src) && file.exists(src)) return(src)
+    p2 <- file.path("Input", fname)
+    if (file.exists(p2)) return(p2)
+    NULL
+  }
   for (f in static_defaults) {
-    src <- find_input_file(tools::file_path_sans_ext(f))
-    if (is.null(src)) src <- file.path("Input", f)
-    if (!is.null(src) && file.exists(src)) file.copy(src, inp_path(f), overwrite=TRUE)
+    src <- resolve_default_input(f)
+    if (!is.null(src) && file.exists(src)) {
+      dest <- inp_path(f)
+      file.copy(src, dest, overwrite=TRUE)
+      role <- static_role_map[[f]]
+      if (!is.null(role)) files_created[[role]] <- dest
+    }
   }
 
   # Physical Environment — copy default when not manually entered / uploaded
@@ -1284,6 +1315,16 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
           input_data_list[[file_key]][[current_idx]] <- df
           cat("[Wizard] Use default files: loaded", file_key,
               "from", basename(file_path), "\n")
+          # Copy the default into the snapshot folder and record its path so the
+          # output-file metadata reports the real file (not "calculated"). Only
+          # IndoorLight is surfaced in the metadata header, but copying all keeps
+          # the snapshot self-contained.
+          if (file.exists(file_path)) {
+            dest <- file.path(output_dir, basename(file_path))
+            tryCatch(file.copy(file_path, dest, overwrite = TRUE),
+                     error = function(e) NULL)
+            if (i == 9L) files_created[["IndoorLight"]] <<- dest
+          }
         }
       }
 
@@ -1410,6 +1451,31 @@ assemble_and_write_wizard_data <- function(input, wizard_state, output_dir = NUL
                                                    current_idx, output_dir)
   input_data_list <- handle_wizard_light_inputs(input, input_data_list, current_idx, output_dir)
 
+
+  # ── Record input-file provenance into the OutputList entry ──────────────────
+  # Save.results() (SIACSPostProcessing.R) writes a metadata comment block at
+  # the top of each output file listing the input files used. Those fields are
+  # read from OutputList[[idx]]$BoxData, $Time, etc. Populate them now from the
+  # snapshot files we just wrote (files_created is keyed by engine role).
+  OutputList <- get("OutputList", envir = .GlobalEnv)
+  if (length(OutputList) >= current_idx && !is.null(OutputList[[current_idx]])) {
+    fc_path <- function(key) {
+      v <- files_created[[key]]
+      if (!is.null(v) && nzchar(v)) basename(v) else ""
+    }
+    OutputList[[current_idx]]$BoxData               <- fc_path("BoxData")
+    OutputList[[current_idx]]$Time                  <- fc_path("Time")
+    OutputList[[current_idx]]$DepositionV           <- fc_path("DepositionV")
+    OutputList[[current_idx]]$PhysicalEnvironment   <- fc_path("PhysicalEnvironment")
+    OutputList[[current_idx]]$OutdoorConcentrations <- fc_path("OutdoorConcentrations")
+    OutputList[[current_idx]]$EmissionProfiles      <- fc_path("EmissionProfiles")
+    OutputList[[current_idx]]$Activities            <- fc_path("Activities")
+    # IndoorLight may be auto-generated (no file recorded); report as such.
+    il <- fc_path("IndoorLight")
+    OutputList[[current_idx]]$IndoorLight <-
+      if (nzchar(il)) il else "(calculated by SIACS)"
+    assign("OutputList", OutputList, envir = .GlobalEnv)
+  }
 
   # Finalize
   assign("input_data_list", input_data_list, envir=.GlobalEnv)

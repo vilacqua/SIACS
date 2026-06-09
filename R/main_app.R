@@ -138,7 +138,7 @@ siacs_log_line(SIACS_STARTUP_LOG,
 
 # ===== Main UI =====
 ui <- navbarPage(
-  title = NULL,
+  title = "SIACS BETA v.1.0.0",
   selected = "Simulation Queue",
   position = "static-top",
 
@@ -317,8 +317,8 @@ ui <- navbarPage(
       id    = "clear_queue_modal",
       title = "Clear Queue",
       static = FALSE,
-      p("This will remove all simulations from the queue and delete their input directories on disk."),
-      p(strong("This cannot be undone. Are you sure?")),
+      p("This will remove all simulations from the queue so you can start a new one."),
+      p("Your completed runs' input and output files on disk will be kept."),
       footer = tagList(
         actionButton("clear_queue_confirm", "Yes, Clear All",
           style = "background:#e74c3c;color:#fff;"),
@@ -343,7 +343,7 @@ ui <- navbarPage(
           tags$label("Output folder"),
           div(style = "display:flex; gap:6px; align-items:center;",
             textInput("results_folder", label = NULL,
-              value       = getwd(),
+              value       = SIACS_WORKSPACE_DIR,
               placeholder = "Path to folder containing Output_* directories",
               width       = "100%"),
             shinyDirButton("results_browse", "Browse",
@@ -765,7 +765,7 @@ server <- function(input, output, session) {
         paste0("\u26a0 A run named \"", nm, "\" already exists in the queue.")))
     # Also check on-disk dirs
     safe <- sanitise_run_name(nm)
-    existing_dirs <- list.dirs(".", recursive = FALSE, full.names = FALSE)
+    existing_dirs <- list.dirs(SIACS_WORKSPACE_DIR, recursive = FALSE, full.names = FALSE)
     collides <- any(grepl(paste0("^Input_", safe, "_"), existing_dirs))
     if (collides)
       return(div(style = "color:#e67e22;font-size:12px;margin-top:2px;",
@@ -787,6 +787,11 @@ server <- function(input, output, session) {
     # the Simulation Summary modal is confirmed.
     pending_idx <- as.integer(sim_num())
     tmp_in_dir  <- paste0("Input_tmp_", pending_idx, "_", format(Sys.time(), "%Y-%m-%d_%H%M%S"))
+    # Anchor to the writable workspace (absolute) so the snapshot lands there
+    # regardless of the session's current working directory (Shiny's runApp may
+    # reset cwd to the app dir at runtime).
+    tmp_in_dir  <- normalizePath(file.path(SIACS_WORKSPACE_DIR, tmp_in_dir),
+                                 winslash = "/", mustWork = FALSE)
     dir.create(tmp_in_dir, recursive = TRUE, showWarnings = FALSE)
     instance_dirs <- if (exists("instance_dirs", envir = .GlobalEnv))
       get("instance_dirs", envir = .GlobalEnv) else list()
@@ -883,7 +888,7 @@ server <- function(input, output, session) {
 
     # Uniqueness check against on-disk dirs
     safe <- sanitise_run_name(nm)
-    existing_dirs <- list.dirs(".", recursive = FALSE, full.names = FALSE)
+    existing_dirs <- list.dirs(SIACS_WORKSPACE_DIR, recursive = FALSE, full.names = FALSE)
     if (any(grepl(paste0("^Input_", safe, "_"), existing_dirs))) {
       showNotification(
         paste0('An input folder for "', nm, '" already exists on disk. Choose a different name.'),
@@ -894,10 +899,14 @@ server <- function(input, output, session) {
     # Read metadata written by wizard/advanced on completion
     meta <- get_meta()
 
-    # Rename the per-instance temp input dir to the final run-name-prefixed name
+    # Rename the per-instance temp input dir to the final run-name-prefixed name.
+    # Anchor both dirs to the writable workspace (absolute) so they sit alongside
+    # the Output_ dirs regardless of the session's current working directory.
     prefix      <- make_dir_prefix(nm)
-    in_dir      <- paste0("Input_",  prefix)
-    out_dir     <- paste0("Output_", prefix)
+    in_dir      <- normalizePath(file.path(SIACS_WORKSPACE_DIR, paste0("Input_",  prefix)),
+                                 winslash = "/", mustWork = FALSE)
+    out_dir     <- normalizePath(file.path(SIACS_WORKSPACE_DIR, paste0("Output_", prefix)),
+                                 winslash = "/", mustWork = FALSE)
     pending_idx <- as.integer(sim_num())
 
     instance_dirs <- if (exists("instance_dirs", envir = .GlobalEnv))
@@ -1235,6 +1244,30 @@ server <- function(input, output, session) {
       exit_code    <- tryCatch(proc$get_exit_status(), error = function(e) NA)
 
       siacs_proc(NULL)   # mark as done
+
+      # ── Write the full run log into each output directory ──────────────────
+      # Mirrors older SIACS versions that dropped a log file alongside results.
+      run_log_text <- siacs_log()
+      if (!is.null(out_dirs_vec) && length(out_dirs_vec) > 0 &&
+          !is.null(run_log_text) && nzchar(run_log_text)) {
+        log_stamp <- format(Sys.time(), "%Y-%m-%d_%H%M%S")
+        for (od in out_dirs_vec) {
+          if (dir.exists(od)) {
+            log_path <- file.path(od, paste0("SIACS_run_log_", log_stamp, ".txt"))
+            tryCatch(
+              writeLines(c(
+                paste0("SIACS run log — ", Sys.time()),
+                paste0("Exit code: ", exit_code),
+                paste0("Output directory: ", od),
+                strrep("-", 60),
+                run_log_text
+              ), log_path),
+              error = function(e)
+                cat("Could not write run log to", log_path, ":",
+                    conditionMessage(e), "\n"))
+          }
+        }
+      }
 
       # Build one summary line per output directory
       dir_summaries <- if (!is.null(out_dirs_vec) && length(out_dirs_vec) > 0) {
@@ -1806,8 +1839,12 @@ server <- function(input, output, session) {
       get("instance_dirs", envir = .GlobalEnv) else list()
     src_in  <- instance_dirs[[as.character(sim_no)]]$input
     prefix  <- make_dir_prefix(new_name)
-    new_in  <- paste0("Input_",  prefix)
-    new_out <- paste0("Output_", prefix)
+    # Anchor to the writable workspace (absolute) so copies sit alongside the
+    # originals regardless of the session's working directory.
+    new_in  <- normalizePath(file.path(SIACS_WORKSPACE_DIR, paste0("Input_",  prefix)),
+                             winslash = "/", mustWork = FALSE)
+    new_out <- normalizePath(file.path(SIACS_WORKSPACE_DIR, paste0("Output_", prefix)),
+                             winslash = "/", mustWork = FALSE)
 
     if (!is.null(src_in) && dir.exists(src_in)) {
       tryCatch({
@@ -1869,13 +1906,10 @@ server <- function(input, output, session) {
   })
 
   observeEvent(input$clear_queue_confirm, {
-    # Delete all input dirs on disk
-    instance_dirs <- if (exists("instance_dirs", envir = .GlobalEnv))
-      get("instance_dirs", envir = .GlobalEnv) else list()
-    for (entry in instance_dirs) {
-      if (!is.null(entry$input) && dir.exists(entry$input))
-        unlink(entry$input, recursive = TRUE)
-    }
+    # NOTE: We intentionally do NOT delete input/output directories on disk
+    # here. Clearing the queue only resets the in-memory queue state so the
+    # user can start a fresh queue without closing the app. Completed runs'
+    # input and output files are preserved on disk.
     # Reset all state
     data(data.frame(
       Simulation_No = character(), Run_Name = character(),
@@ -1913,6 +1947,7 @@ server <- function(input, output, session) {
 
   # ── shinyFiles: map available volumes for the folder browser ──────────────
   volumes <- c(
+    "SIACS workspace" = SIACS_WORKSPACE_DIR,
     "Working dir" = getwd(),
     getVolumes()()           # adds drive roots (C:\, D:\, / etc.)
   )
@@ -1966,7 +2001,7 @@ server <- function(input, output, session) {
   # with warnings about empty Output_* folders before any sim has run. Only
   # explicit user actions (Scan button) and post-run completion show toasts.
   do_scan <- function(show_warning = FALSE) {
-    root  <- trimws(input$results_folder %||% getwd())
+    root  <- trimws(input$results_folder %||% SIACS_WORKSPACE_DIR)
     files <- scan_results_folder(root)
     if (length(files) == 0) {
       updateSelectInput(session, "results_sim_select",
@@ -1998,7 +2033,7 @@ server <- function(input, output, session) {
     intervalMillis = 3000,
     session        = session,
     checkFunc = function() {
-      root <- trimws(input$results_folder %||% getwd())
+      root <- trimws(input$results_folder %||% SIACS_WORKSPACE_DIR)
       if (!dir.exists(root)) return(NULL)
       # Fast check: mtime of the target output dir
       subdirs  <- list.dirs(root, recursive = FALSE, full.names = TRUE)
