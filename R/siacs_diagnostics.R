@@ -208,8 +208,10 @@ siacs_ensure_packages_installed <- function(pkgs, log_file = NULL) {
 # Resolution order (first writable wins):
 #   1. env var SIACS_WORKSPACE
 #   2. R option "SIACS.workspace"
-#   3. tools::R_user_dir("SIACS", "data")/workspace   (always user-writable)
-#   4. tempdir()/SIACS-workspace                      (last-resort fallback)
+#   3. ~/Documents/SIACS-workspace    (visible, user-friendly)
+#   4. ~/SIACS-workspace              (fallback if Documents is CFA-guarded)
+#   5. tools::R_user_dir("SIACS", "data")/workspace   (always user-writable)
+#   6. tempdir()/SIACS-workspace                      (last-resort fallback)
 siacs_workspace_dir <- function(create = TRUE) {
   is_writable <- function(d) {
     if (is.null(d) || !nzchar(d)) return(FALSE)
@@ -228,6 +230,12 @@ siacs_workspace_dir <- function(create = TRUE) {
   candidates <- c(
     Sys.getenv("SIACS_WORKSPACE", ""),
     getOption("SIACS.workspace", ""),
+    # Prefer a visible user-facing location first (easy to find in Explorer).
+    # Use USERPROFILE (true home dir) rather than path.expand("~") which may
+    # point to OneDrive-redirected Documents on corporate machines.
+    # Guarded by is_writable() so CFA-protected Documents auto-falls through.
+    file.path(Sys.getenv("USERPROFILE", path.expand("~")), "Documents", "SIACS-workspace"),
+    file.path(Sys.getenv("USERPROFILE", path.expand("~")), "SIACS-workspace"),
     tryCatch(file.path(tools::R_user_dir("SIACS", "data"), "workspace"),
              error = function(e) ""),
     file.path(tempdir(), "SIACS-workspace")

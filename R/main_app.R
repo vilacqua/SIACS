@@ -161,6 +161,18 @@ ui <- navbarPage(
       # ── Environment health banner (only shown when problems detected) ────
       uiOutput("siacs_env_banner"),
 
+      # ── Workspace location (always visible) ──────────────────────────────
+      div(style = "background:#f0f4f8;border:1px solid #d0d8e0;border-radius:4px;padding:5px 10px;margin-bottom:8px;font-size:11px;color:#444;",
+        tags$span("\U0001f4c2 Workspace (input/output files): "),
+        tags$code(style = "font-size:11px;", SIACS_WORKSPACE_DIR),
+        tags$a(href = "#", onclick = paste0(
+          "if(navigator.clipboard){navigator.clipboard.writeText('",
+          gsub("\\\\", "\\\\\\\\", gsub("/", "\\\\", SIACS_WORKSPACE_DIR)),
+          "');}return false;"),
+          style = "margin-left:8px;font-size:10px;color:#2980b9;",
+          "(copy path)")
+      ),
+
       # ── Toolbar ───────────────────────────────────────────────────────────
       div(class = "queue-toolbar",
         modal_actionButton("submit", "＋ Add", target = "sim_type_modal",
